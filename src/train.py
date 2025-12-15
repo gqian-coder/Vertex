@@ -25,7 +25,7 @@ class MeshDataset(Dataset):
     """Dataset for mesh-based super-resolution with pre-computed interpolation."""
     
     def __init__(self, coarse_data: Dict = None, fine_data: Dict = None,
-                 interpolated_data: Dict = None,
+                 interpolated_data: Dict = None, timestep_offset: int = 0,
                  use_graph: bool = True, k_neighbors: int = 8,
                  use_cache: bool = True, cache_dir: str = './cache'):
         """
@@ -35,6 +35,8 @@ class MeshDataset(Dataset):
             coarse_data: Coarse mesh data (optional if using interpolated_data)
             fine_data: Fine mesh data (ground truth)
             interpolated_data: Pre-interpolated data on fine mesh (optional)
+            timestep_offset: Timestep offset between interpolated and fine data.
+                           If interpolated[t+offset] = fine[t], set timestep_offset=offset
             use_graph: Whether to build graph structure
             k_neighbors: Number of neighbors for graph
             use_cache: Whether to cache interpolated data
@@ -43,6 +45,7 @@ class MeshDataset(Dataset):
         self.coarse_data = coarse_data
         self.fine_data = fine_data
         self.interpolated_data = interpolated_data
+        self.timestep_offset = timestep_offset
         self.use_graph = use_graph
         self.k_neighbors = k_neighbors
         
@@ -84,7 +87,7 @@ class MeshDataset(Dataset):
         
         # Use pre-interpolated data if available
         if self.interpolated_data is not None:
-            self._prepare_samples_from_interpolated()
+            self._prepare_samples_from_interpolated(timestep_offset=self.timestep_offset)
             return
         
         # Generate cache key
@@ -166,8 +169,13 @@ class MeshDataset(Dataset):
                 pickle.dump(self.samples, f)
             print(f"Saved pre-computed samples to cache: {cache_path}")
     
-    def _prepare_samples_from_interpolated(self):
-        """Prepare samples using pre-interpolated data (correction-only mode)."""
+    def _prepare_samples_from_interpolated(self, timestep_offset: int = 0):
+        """Prepare samples using pre-interpolated data (correction-only mode).
+        
+        Args:
+            timestep_offset: Offset between interpolated and fine timesteps.
+                            If interpolated[t + offset] = fine[t], set offset=offset
+        """
         # Get field names
         field_names = ['velocity_0', 'velocity_1', 'pressure', 'temperature']
         if 'velocity_x' in self.interpolated_data['fields']:
@@ -186,14 +194,33 @@ class MeshDataset(Dataset):
         fine_field = self.fine_data['fields'][first_field]
         
         if interp_field.ndim == 2:
-            num_timesteps = min(interp_field.shape[0], fine_field.shape[0])
+            # Account for offset when determining number of valid timesteps
+            num_interp_timesteps = interp_field.shape[0]
+            num_fine_timesteps = fine_field.shape[0]
+            
+            # Calculate valid range: interpolated[t_interp] matches fine[t_fine]
+            # where t_interp = t_fine + offset
+            if timestep_offset >= 0:
+                # Positive offset: interpolated is ahead
+                num_timesteps = min(num_interp_timesteps - timestep_offset, num_fine_timesteps)
+            else:
+                # Negative offset: fine is ahead
+                num_timesteps = min(num_interp_timesteps, num_fine_timesteps + timestep_offset)
+            
+            if num_timesteps <= 0:
+                raise ValueError(f"Invalid timestep offset {timestep_offset}: no overlapping timesteps!")
         else:
             num_timesteps = 1
         
+        if timestep_offset != 0:
+            print(f"Using timestep offset: interpolated[t+{timestep_offset}] = fine[t]")
         print(f"Loading {num_timesteps} timesteps from pre-interpolated data...")
         
         # Create samples for each timestep
-        for t in range(num_timesteps):
+        for t_fine in range(num_timesteps):
+            # Calculate corresponding interpolated timestep
+            t_interp = t_fine + timestep_offset
+            
             # Collect interpolated and fine features
             interp_features = []
             fine_features = []
@@ -203,8 +230,8 @@ class MeshDataset(Dataset):
                 fine_f = self.fine_data['fields'][field_name]
                 
                 if interp_f.ndim == 2:
-                    interp_features.append(interp_f[t])
-                    fine_features.append(fine_f[t])
+                    interp_features.append(interp_f[t_interp])
+                    fine_features.append(fine_f[t_fine])
                 else:
                     interp_features.append(interp_f)
                     fine_features.append(fine_f)
@@ -214,7 +241,8 @@ class MeshDataset(Dataset):
             fine_features = np.stack(fine_features, axis=-1)
             
             self.samples.append({
-                'timestep': t,
+                'timestep': t_fine,
+                'timestep_interp': t_interp,
                 'coarse_interp': interp_features,  # Already interpolated!
                 'fine_features': fine_features
             })

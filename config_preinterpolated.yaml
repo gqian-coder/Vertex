@@ -8,6 +8,10 @@ data:
   # Path to ground truth fine mesh solution
   fine_file: '/home/qg7/Vertex/dataset/002-Re-148_3-AC-beta-10000-Helios/360-120/cropped.e'
   
+  # Timestep offset: interpolated[t + offset] = fine[t]
+  # For your data: interpolated[ts+9] = fine[ts], so offset=9
+  timestep_offset: 9
+  
   # Caching (optional, usually not needed for pre-interpolated data)
   use_cache: false
   cache_dir: './cache'

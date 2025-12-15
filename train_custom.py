@@ -45,9 +45,12 @@ def train_custom(config_path='config_custom.yaml'):
         
         # Create dataset with pre-interpolated data
         use_graph = config['model']['type'] in ['gnn', 'encoder_decoder']
+        timestep_offset = config['data'].get('timestep_offset', 0)
+        
         dataset = MeshDataset(
             interpolated_data=interpolated_data,
             fine_data=fine_data,
+            timestep_offset=timestep_offset,
             use_graph=use_graph,
             k_neighbors=config['model']['k_neighbors'],
             use_cache=config['data'].get('use_cache', True),
