@@ -25,29 +25,58 @@ def train_custom(config_path='config_custom.yaml'):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     
-    print(f"Loading data from custom files...")
-    print(f"  Coarse: {config['data']['coarse_file']}")
-    print(f"  Fine: {config['data']['fine_file']}")
+    # Check if using pre-interpolated data
+    use_preinterpolated = 'interpolated_file' in config['data']
     
-    # Load data
-    coarse_reader = ExodusDataLoader(config['data']['coarse_file'])
-    coarse_data = coarse_reader.load()
-    coarse_reader.close()
-    
-    fine_reader = ExodusDataLoader(config['data']['fine_file'])
-    fine_data = fine_reader.load()
-    fine_reader.close()
-    
-    # Create dataset
-    use_graph = config['model']['type'] in ['gnn', 'encoder_decoder']
-    dataset = MeshDataset(
-        coarse_data=coarse_data,
-        fine_data=fine_data,
-        use_graph=use_graph,
-        k_neighbors=config['model']['k_neighbors'],
-        use_cache=config['data']['use_cache'],
-        cache_dir=config['data']['cache_dir']
-    )
+    if use_preinterpolated:
+        print(f"Loading pre-interpolated data (correction-only mode)...")
+        print(f"  Interpolated: {config['data']['interpolated_file']}")
+        print(f"  Ground truth: {config['data']['fine_file']}")
+        
+        # Load pre-interpolated data
+        interp_reader = ExodusDataLoader(config['data']['interpolated_file'])
+        interpolated_data = interp_reader.load()
+        interp_reader.close()
+        
+        # Load ground truth fine data
+        fine_reader = ExodusDataLoader(config['data']['fine_file'])
+        fine_data = fine_reader.load()
+        fine_reader.close()
+        
+        # Create dataset with pre-interpolated data
+        use_graph = config['model']['type'] in ['gnn', 'encoder_decoder']
+        dataset = MeshDataset(
+            interpolated_data=interpolated_data,
+            fine_data=fine_data,
+            use_graph=use_graph,
+            k_neighbors=config['model']['k_neighbors'],
+            use_cache=config['data'].get('use_cache', True),
+            cache_dir=config['data'].get('cache_dir', './cache')
+        )
+    else:
+        print(f"Loading data from custom files...")
+        print(f"  Coarse: {config['data']['coarse_file']}")
+        print(f"  Fine: {config['data']['fine_file']}")
+        
+        # Load data
+        coarse_reader = ExodusDataLoader(config['data']['coarse_file'])
+        coarse_data = coarse_reader.load()
+        coarse_reader.close()
+        
+        fine_reader = ExodusDataLoader(config['data']['fine_file'])
+        fine_data = fine_reader.load()
+        fine_reader.close()
+        
+        # Create dataset
+        use_graph = config['model']['type'] in ['gnn', 'encoder_decoder']
+        dataset = MeshDataset(
+            coarse_data=coarse_data,
+            fine_data=fine_data,
+            use_graph=use_graph,
+            k_neighbors=config['model']['k_neighbors'],
+            use_cache=config['data']['use_cache'],
+            cache_dir=config['data']['cache_dir']
+        )
     
     print(f"Dataset size: {len(dataset)} timesteps")
     

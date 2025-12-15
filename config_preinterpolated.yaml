@@ -1,0 +1,34 @@
+# Training configuration using pre-interpolated data (correction-only mode)
+# The model learns to correct interpolation errors rather than full coarse-to-fine mapping
+
+data:
+  # Path to pre-interpolated solution on fine mesh
+  interpolated_file: '/home/qg7/Vertex/paraview/180-60_to_360-120_interpolated_linear.exo'
+  
+  # Path to ground truth fine mesh solution
+  fine_file: '/home/qg7/Vertex/dataset/002-Re-148_3-AC-beta-10000-Helios/360-120/cropped.e'
+  
+  # Caching (optional, usually not needed for pre-interpolated data)
+  use_cache: false
+  cache_dir: './cache'
+
+model:
+  type: 'gnn'                    # Options: gnn, encoder_decoder, mlp
+  hidden_channels: 128
+  num_layers: 4
+  dropout: 0.1
+  k_neighbors: 8                 # Number of neighbors for graph construction
+
+training:
+  batch_size: 1                  # Graph data typically uses batch_size=1
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  num_epochs: 100
+  save_every: 10
+  output_dir: './outputs_correction'
+  validation_split: 0.2          # Use 20% of timesteps for validation
+
+# Note: This mode trains the model to learn corrections/residuals
+# Input: Pre-interpolated fields on fine mesh
+# Output: Corrected/refined fields
+# Target: Ground truth fine mesh fields

@@ -24,15 +24,17 @@ from models import MeshGNN, MeshEncoderDecoder, SimpleMLP, create_graph_data
 class MeshDataset(Dataset):
     """Dataset for mesh-based super-resolution with pre-computed interpolation."""
     
-    def __init__(self, coarse_data: Dict, fine_data: Dict, 
+    def __init__(self, coarse_data: Dict = None, fine_data: Dict = None,
+                 interpolated_data: Dict = None,
                  use_graph: bool = True, k_neighbors: int = 8,
                  use_cache: bool = True, cache_dir: str = './cache'):
         """
         Initialize dataset.
         
         Args:
-            coarse_data: Coarse mesh data
-            fine_data: Fine mesh data
+            coarse_data: Coarse mesh data (optional if using interpolated_data)
+            fine_data: Fine mesh data (ground truth)
+            interpolated_data: Pre-interpolated data on fine mesh (optional)
             use_graph: Whether to build graph structure
             k_neighbors: Number of neighbors for graph
             use_cache: Whether to cache interpolated data
@@ -40,22 +42,35 @@ class MeshDataset(Dataset):
         """
         self.coarse_data = coarse_data
         self.fine_data = fine_data
+        self.interpolated_data = interpolated_data
         self.use_graph = use_graph
         self.k_neighbors = k_neighbors
         
         # Get coordinates
-        self.coarse_coords = coarse_data['coordinates']
-        self.fine_coords = fine_data['coordinates']
+        if interpolated_data is not None:
+            # Use pre-interpolated data approach
+            self.fine_coords = interpolated_data['coordinates']
+            print("Using pre-interpolated data (correction-only mode)")
+        else:
+            # Traditional approach: interpolate from coarse
+            if coarse_data is None:
+                raise ValueError("Must provide either coarse_data or interpolated_data")
+            self.coarse_coords = coarse_data['coordinates']
+            self.fine_coords = fine_data['coordinates']
         
         # Check if mesh is 2D (z-range is very small)
         z_range = np.ptp(self.fine_coords[:, 2])
         if z_range < 1e-6:
             print(f"    Detected 2D mesh (z-range: {z_range:.2e}), using only x-y coordinates")
-            self.coarse_coords = self.coarse_coords[:, :2]
+            if interpolated_data is None:
+                self.coarse_coords = self.coarse_coords[:, :2]
             self.fine_coords = self.fine_coords[:, :2]
         
         # Pre-compute and cache all interpolated data
-        print("Preparing dataset (interpolating coarse to fine mesh)...")
+        if interpolated_data is not None:
+            print("Preparing dataset from pre-interpolated fields...")
+        else:
+            print("Preparing dataset (interpolating coarse to fine mesh)...")
         self.samples = []
         self._prepare_samples_with_cache(use_cache, cache_dir)
         
@@ -66,6 +81,11 @@ class MeshDataset(Dataset):
         from pathlib import Path
         import pickle
         import hashlib
+        
+        # Use pre-interpolated data if available
+        if self.interpolated_data is not None:
+            self._prepare_samples_from_interpolated()
+            return
         
         # Generate cache key
         cache_key = f"{self.coarse_data['num_nodes']}_{self.fine_data['num_nodes']}"
@@ -139,12 +159,67 @@ class MeshDataset(Dataset):
                 'fine_features': fine_features
             })
         
-        # Save to cache
+        # Cache samples
         if use_cache:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             with open(cache_path, 'wb') as f:
                 pickle.dump(self.samples, f)
             print(f"Saved pre-computed samples to cache: {cache_path}")
+    
+    def _prepare_samples_from_interpolated(self):
+        """Prepare samples using pre-interpolated data (correction-only mode)."""
+        # Get field names
+        field_names = ['velocity_0', 'velocity_1', 'pressure', 'temperature']
+        if 'velocity_x' in self.interpolated_data['fields']:
+            field_names = ['velocity_x', 'velocity_y', 'pressure', 'temperature']
+        
+        # Check which fields are available
+        available_fields = [f for f in field_names 
+                          if f in self.interpolated_data['fields'] and f in self.fine_data['fields']]
+        
+        if not available_fields:
+            raise ValueError("No matching fields found between interpolated and fine data!")
+        
+        # Get number of timesteps
+        first_field = available_fields[0]
+        interp_field = self.interpolated_data['fields'][first_field]
+        fine_field = self.fine_data['fields'][first_field]
+        
+        if interp_field.ndim == 2:
+            num_timesteps = min(interp_field.shape[0], fine_field.shape[0])
+        else:
+            num_timesteps = 1
+        
+        print(f"Loading {num_timesteps} timesteps from pre-interpolated data...")
+        
+        # Create samples for each timestep
+        for t in range(num_timesteps):
+            # Collect interpolated and fine features
+            interp_features = []
+            fine_features = []
+            
+            for field_name in available_fields:
+                interp_f = self.interpolated_data['fields'][field_name]
+                fine_f = self.fine_data['fields'][field_name]
+                
+                if interp_f.ndim == 2:
+                    interp_features.append(interp_f[t])
+                    fine_features.append(fine_f[t])
+                else:
+                    interp_features.append(interp_f)
+                    fine_features.append(fine_f)
+            
+            # Stack features
+            interp_features = np.stack(interp_features, axis=-1)
+            fine_features = np.stack(fine_features, axis=-1)
+            
+            self.samples.append({
+                'timestep': t,
+                'coarse_interp': interp_features,  # Already interpolated!
+                'fine_features': fine_features
+            })
+        
+        print(f"Loaded {len(self.samples)} samples from pre-interpolated data")
     
     def __len__(self):
         return len(self.samples)
