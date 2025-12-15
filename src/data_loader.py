@@ -228,15 +228,15 @@ def load_all_resolutions(base_dir: str) -> Dict[str, Dict]:
     """
     base_path = Path(base_dir)
     resolutions = {
-        'coarse': '071-Re-148_3-EDAC-beta-10000-O-45-15-Helios',
-        'medium': '072-Re-148_3-EDAC-beta-10000-O-90-30-Helios',
-        'fine': '073-Re-148_3-EDAC-beta-10000-O-180-60-Helios',
-        'finest': '074-Re-148_3-EDAC-beta-10000-O-360-120-Helios'
+        'coarse': '45-15',
+        'medium': '90-30',
+        'fine': '180-60',
+        'finest': '360-120'
     }
     
     all_data = {}
     for res_name, folder_name in resolutions.items():
-        exo_file = base_path / folder_name / 'restart' / 'solution.exo'
+        exo_file = base_path / folder_name / 'cropped.e'
         if exo_file.exists():
             print(f"\nLoading {res_name} resolution from {exo_file}...")
             loader = ExodusDataLoader(str(exo_file))
