@@ -1,0 +1,29 @@
+# Training configuration for mesh super-resolution
+
+data:
+  dataset_path: '/lustre/orion/csc143/proj-shared/gongq/frontier/VERTEX/dataset'
+  source_resolution: 'coarse'   # Options: coarse, medium, fine
+  target_resolution: 'fine'      # Options: medium, fine, finest
+  use_cache: true                # Cache interpolated data (recommended!)
+  cache_dir: './cache'           # Directory for cache files
+
+model:
+  type: 'gnn'                    # Options: gnn, encoder_decoder, mlp
+  hidden_channels: 128
+  num_layers: 4
+  num_levels: 3                  # For encoder_decoder
+  dropout: 0.1
+  k_neighbors: 8                 # Number of neighbors for graph construction
+
+training:
+  batch_size: 1                  # Usually 1 for graph data
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  num_epochs: 100
+  save_every: 10
+  output_dir: './outputs'
+
+# To train with different settings, modify these parameters:
+# - For coarse -> finest: Change target_resolution to 'finest'
+# - For larger model: Increase hidden_channels and num_layers
+# - For faster training: Reduce num_epochs

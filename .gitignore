@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Cache and temporary files
+cache/
+*.pkl
+*.log
+nohup.out
+
+# Data files
+dataset/
+paraview/
+*.exo
+*.e
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Model outputs
+outputs/
+checkpoints/
+*.pt
+*.pth
+
+# Plots
+*.png
+*.jpg
+*.pdf
+
+# Misc
+run_cmd.txt

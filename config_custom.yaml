@@ -1,0 +1,32 @@
+# Training configuration for custom interpolation experiment
+
+data:
+  # Paths to your specific data files
+  coarse_file: '/home/qg7/Vertex/dataset/002-Re-148_3-AC-beta-10000-Helios/180-60/cropped.e'
+  fine_file: '/home/qg7/Vertex/dataset/002-Re-148_3-AC-beta-10000-Helios/360-120/cropped.e'
+  
+  # Time offset (Fine[N] = Interp[N+54])
+  time_offset: 54
+  
+  # Caching
+  use_cache: true
+  cache_dir: './cache'
+
+model:
+  type: 'gnn'                    # Options: gnn, encoder_decoder, mlp
+  hidden_channels: 128
+  num_layers: 4
+  dropout: 0.1
+  k_neighbors: 8                 # Number of neighbors for graph construction
+
+training:
+  batch_size: 1                  # Graph data typically uses batch_size=1
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  num_epochs: 100
+  save_every: 10
+  output_dir: './outputs'
+  validation_split: 0.2          # Use 20% of timesteps for validation
+
+# Note: The training script will automatically handle linear interpolation
+# from coarse to fine mesh during data loading
