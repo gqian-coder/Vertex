@@ -27,7 +27,8 @@ class MeshDataset(Dataset):
     def __init__(self, coarse_data: Dict = None, fine_data: Dict = None,
                  interpolated_data: Dict = None, timestep_offset: int = 0,
                  use_graph: bool = True, k_neighbors: int = 8,
-                 use_cache: bool = True, cache_dir: str = './cache'):
+                 use_cache: bool = True, cache_dir: str = './cache',
+                 target_mode: str = 'absolute'):
         """
         Initialize dataset.
         
@@ -41,6 +42,9 @@ class MeshDataset(Dataset):
             k_neighbors: Number of neighbors for graph
             use_cache: Whether to cache interpolated data
             cache_dir: Directory for cache files
+            target_mode: Training target type:
+                        - 'absolute': target is fine fields
+                        - 'residual': target is (fine - interpolated) fields
         """
         self.coarse_data = coarse_data
         self.fine_data = fine_data
@@ -48,6 +52,9 @@ class MeshDataset(Dataset):
         self.timestep_offset = timestep_offset
         self.use_graph = use_graph
         self.k_neighbors = k_neighbors
+        if target_mode not in ['absolute', 'residual']:
+            raise ValueError(f"Unknown target_mode: {target_mode} (expected 'absolute' or 'residual')")
+        self.target_mode = target_mode
         
         # Get coordinates
         if interpolated_data is not None:
@@ -258,13 +265,18 @@ class MeshDataset(Dataset):
         # Get pre-computed interpolated features (no interpolation here!)
         coarse_interp = sample['coarse_interp']  # (n_fine_nodes, n_features)
         fine_features = sample['fine_features']  # (n_fine_nodes, n_features)
+
+        if self.target_mode == 'residual':
+            target = fine_features - coarse_interp
+        else:
+            target = fine_features
         
         if self.use_graph:
             # Create graph data
             data = create_graph_data(
                 self.fine_coords,
                 coarse_interp,
-                target=fine_features,
+                target=target,
                 k=self.k_neighbors
             )
             return data
@@ -274,7 +286,7 @@ class MeshDataset(Dataset):
                 torch.FloatTensor(self.fine_coords),
                 torch.FloatTensor(coarse_interp)
             ], dim=-1)
-            y = torch.FloatTensor(fine_features)
+            y = torch.FloatTensor(target)
             return x, y
 
 

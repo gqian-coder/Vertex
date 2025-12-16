@@ -46,6 +46,11 @@ def train_custom(config_path='config_custom.yaml'):
         # Create dataset with pre-interpolated data
         use_graph = config['model']['type'] in ['gnn', 'encoder_decoder']
         timestep_offset = config['data'].get('timestep_offset', 0)
+
+        residual_learning = bool(config.get('training', {}).get('residual_learning', False))
+        target_mode = 'residual' if residual_learning else 'absolute'
+        if residual_learning:
+            print("Using residual learning: target = fine - interpolated")
         
         dataset = MeshDataset(
             interpolated_data=interpolated_data,
@@ -54,7 +59,8 @@ def train_custom(config_path='config_custom.yaml'):
             use_graph=use_graph,
             k_neighbors=config['model']['k_neighbors'],
             use_cache=config['data'].get('use_cache', True),
-            cache_dir=config['data'].get('cache_dir', './cache')
+            cache_dir=config['data'].get('cache_dir', './cache'),
+            target_mode=target_mode
         )
     else:
         print(f"Loading data from custom files...")
