@@ -51,6 +51,20 @@ def train_custom(config_path='config_custom.yaml'):
         target_mode = 'residual' if residual_learning else 'absolute'
         if residual_learning:
             print("Using residual learning: target = fine - interpolated")
+
+        residual_normalization = bool(config.get('training', {}).get('residual_normalization', False))
+        residual_norm_eps = float(config.get('training', {}).get('residual_norm_eps', 1e-8))
+        if residual_learning and residual_normalization:
+            print("Using residual normalization: (residual - mean) / std")
+
+        smoothness_lambda = float(config.get('training', {}).get('smoothness_lambda', 0.0))
+        if smoothness_lambda and smoothness_lambda > 0:
+            if not use_graph:
+                print("WARNING: smoothness_lambda set but model is not graph-based; ignoring smoothness.")
+                smoothness_lambda = 0.0
+            elif not residual_learning:
+                print("WARNING: smoothness_lambda set but residual_learning is false; ignoring smoothness.")
+                smoothness_lambda = 0.0
         
         dataset = MeshDataset(
             interpolated_data=interpolated_data,
@@ -60,7 +74,9 @@ def train_custom(config_path='config_custom.yaml'):
             k_neighbors=config['model']['k_neighbors'],
             use_cache=config['data'].get('use_cache', True),
             cache_dir=config['data'].get('cache_dir', './cache'),
-            target_mode=target_mode
+            target_mode=target_mode,
+            residual_normalize=(residual_learning and residual_normalization),
+            residual_norm_eps=residual_norm_eps,
         )
     else:
         print(f"Loading data from custom files...")
@@ -86,6 +102,9 @@ def train_custom(config_path='config_custom.yaml'):
             use_cache=config['data']['use_cache'],
             cache_dir=config['data']['cache_dir']
         )
+
+        # These features are currently only intended for correction/residual training.
+        smoothness_lambda = 0.0
     
     print(f"Dataset size: {len(dataset)} timesteps")
     
@@ -177,10 +196,25 @@ def train_custom(config_path='config_custom.yaml'):
     print("\nStarting training...")
     for epoch in range(config['training']['num_epochs']):
         # Train
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, device, use_graph)
+        train_loss = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            device,
+            use_graph,
+            smoothness_lambda=smoothness_lambda,
+        )
         
         # Validate
-        val_loss = validate(model, val_loader, criterion, device, use_graph)
+        val_loss = validate(
+            model,
+            val_loader,
+            criterion,
+            device,
+            use_graph,
+            smoothness_lambda=smoothness_lambda,
+        )
         
         # Learning rate scheduling
         scheduler.step(val_loss)
@@ -196,7 +230,8 @@ def train_custom(config_path='config_custom.yaml'):
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': val_loss,
-                'config': config
+                'config': config,
+                'residual_stats': getattr(dataset, 'residual_stats', None),
             }
             torch.save(
                 checkpoint,
@@ -211,7 +246,8 @@ def train_custom(config_path='config_custom.yaml'):
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': val_loss,
-                'config': config
+                'config': config,
+                'residual_stats': getattr(dataset, 'residual_stats', None),
             }
             torch.save(
                 checkpoint,

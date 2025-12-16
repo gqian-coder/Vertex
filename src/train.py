@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 
 from data_loader import load_all_resolutions, ExodusDataLoader
 from mesh_interpolation import MeshInterpolator, create_training_pairs
-from models import MeshGNN, MeshEncoderDecoder, SimpleMLP, create_graph_data
+from models import MeshGNN, MeshEncoderDecoder, SimpleMLP, create_graph_data, build_knn_graph
 
 
 class MeshDataset(Dataset):
@@ -28,7 +28,10 @@ class MeshDataset(Dataset):
                  interpolated_data: Dict = None, timestep_offset: int = 0,
                  use_graph: bool = True, k_neighbors: int = 8,
                  use_cache: bool = True, cache_dir: str = './cache',
-                 target_mode: str = 'absolute'):
+                 target_mode: str = 'absolute',
+                 residual_normalize: bool = False,
+                 residual_stats: Optional[Dict] = None,
+                 residual_norm_eps: float = 1e-8):
         """
         Initialize dataset.
         
@@ -45,6 +48,11 @@ class MeshDataset(Dataset):
             target_mode: Training target type:
                         - 'absolute': target is fine fields
                         - 'residual': target is (fine - interpolated) fields
+            residual_normalize: If True and target_mode=='residual', normalize residual targets by
+                                (residual - mean) / std per variable.
+            residual_stats: Optional dict with keys {'mean', 'std'} to reuse existing stats.
+                            If not provided and residual_normalize is True, stats are computed from this dataset.
+            residual_norm_eps: Minimum std clamp to avoid division by ~0.
         """
         self.coarse_data = coarse_data
         self.fine_data = fine_data
@@ -55,6 +63,25 @@ class MeshDataset(Dataset):
         if target_mode not in ['absolute', 'residual']:
             raise ValueError(f"Unknown target_mode: {target_mode} (expected 'absolute' or 'residual')")
         self.target_mode = target_mode
+
+        self.residual_normalize = bool(residual_normalize)
+        self.residual_norm_eps = float(residual_norm_eps)
+        self.residual_stats: Optional[Dict] = None
+        self._residual_mean: Optional[np.ndarray] = None
+        self._residual_std: Optional[np.ndarray] = None
+        if residual_stats is not None:
+            # Expect lists/arrays of length n_features
+            mean = np.asarray(residual_stats.get('mean', None), dtype=np.float32)
+            std = np.asarray(residual_stats.get('std', None), dtype=np.float32)
+            if mean.ndim != 1 or std.ndim != 1:
+                raise ValueError("residual_stats['mean'] and ['std'] must be 1D")
+            self._residual_mean = mean
+            self._residual_std = np.maximum(std, self.residual_norm_eps).astype(np.float32)
+            self.residual_stats = {
+                'mean': self._residual_mean.tolist(),
+                'std': self._residual_std.tolist(),
+                'eps': self.residual_norm_eps,
+            }
         
         # Get coordinates
         if interpolated_data is not None:
@@ -75,6 +102,12 @@ class MeshDataset(Dataset):
             if interpolated_data is None:
                 self.coarse_coords = self.coarse_coords[:, :2]
             self.fine_coords = self.fine_coords[:, :2]
+
+        # Precompute graph connectivity once (shared across all timesteps)
+        self._edge_index = None
+        if self.use_graph:
+            print(f"    Precomputing kNN graph once (k={self.k_neighbors})...")
+            self._edge_index = build_knn_graph(self.fine_coords, k=self.k_neighbors)
         
         # Pre-compute and cache all interpolated data
         if interpolated_data is not None:
@@ -83,8 +116,50 @@ class MeshDataset(Dataset):
             print("Preparing dataset (interpolating coarse to fine mesh)...")
         self.samples = []
         self._prepare_samples_with_cache(use_cache, cache_dir)
+
+        # If residual learning + normalization requested, compute stats from dataset unless provided.
+        if self.target_mode == 'residual' and self.residual_normalize and self._residual_mean is None:
+            self._compute_residual_stats_from_samples()
         
         print(f"Dataset created with {len(self.samples)} samples")
+
+    def _compute_residual_stats_from_samples(self) -> None:
+        if not self.samples:
+            raise ValueError("Cannot compute residual stats: dataset has no samples")
+
+        # Accumulate per-feature moments over all nodes and timesteps.
+        # samples[*]['coarse_interp'] and ['fine_features'] are (n_nodes, n_features)
+        sum_ = None
+        sumsq = None
+        count = 0
+        for sample in self.samples:
+            coarse_interp = sample['coarse_interp'].astype(np.float64)
+            fine_features = sample['fine_features'].astype(np.float64)
+            residual = fine_features - coarse_interp
+            if sum_ is None:
+                sum_ = np.sum(residual, axis=0)
+                sumsq = np.sum(residual ** 2, axis=0)
+            else:
+                sum_ += np.sum(residual, axis=0)
+                sumsq += np.sum(residual ** 2, axis=0)
+            count += residual.shape[0]
+
+        mean = (sum_ / max(count, 1)).astype(np.float32)
+        var = (sumsq / max(count, 1)) - mean.astype(np.float64) ** 2
+        var = np.maximum(var, 0.0)
+        std = np.sqrt(var).astype(np.float32)
+        std = np.maximum(std, self.residual_norm_eps).astype(np.float32)
+
+        self._residual_mean = mean
+        self._residual_std = std
+        self.residual_stats = {
+            'mean': self._residual_mean.tolist(),
+            'std': self._residual_std.tolist(),
+            'eps': self.residual_norm_eps,
+        }
+        print("    Residual normalization enabled")
+        print(f"      mean: {self._residual_mean}")
+        print(f"      std : {self._residual_std}")
     
     def _prepare_samples_with_cache(self, use_cache: bool, cache_dir: str):
         """Prepare all training samples with pre-computed interpolation."""
@@ -268,6 +343,10 @@ class MeshDataset(Dataset):
 
         if self.target_mode == 'residual':
             target = fine_features - coarse_interp
+            if self.residual_normalize:
+                if self._residual_mean is None or self._residual_std is None:
+                    raise RuntimeError("Residual normalization requested but stats were not computed")
+                target = (target - self._residual_mean) / self._residual_std
         else:
             target = fine_features
         
@@ -277,7 +356,8 @@ class MeshDataset(Dataset):
                 self.fine_coords,
                 coarse_interp,
                 target=target,
-                k=self.k_neighbors
+                k=self.k_neighbors,
+                edge_index=self._edge_index
             )
             return data
         else:
@@ -290,7 +370,23 @@ class MeshDataset(Dataset):
             return x, y
 
 
-def train_epoch(model, loader, optimizer, criterion, device, use_graph=True):
+def _graph_smoothness_loss(pred: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+    """Graph Laplacian-style smoothness loss: mean_{(i,j) in E} ||pred_i - pred_j||^2."""
+    src = edge_index[0]
+    dst = edge_index[1]
+    diff = pred[src] - pred[dst]
+    return (diff ** 2).mean()
+
+
+def train_epoch(
+    model,
+    loader,
+    optimizer,
+    criterion,
+    device,
+    use_graph=True,
+    smoothness_lambda: float = 0.0,
+):
     """Train for one epoch."""
     model.train()
     total_loss = 0
@@ -303,6 +399,8 @@ def train_epoch(model, loader, optimizer, criterion, device, use_graph=True):
             batch = batch.to(device)
             out = model(batch.x, batch.edge_index)
             loss = criterion(out, batch.y)
+            if smoothness_lambda and smoothness_lambda > 0:
+                loss = loss + float(smoothness_lambda) * _graph_smoothness_loss(out, batch.edge_index)
         else:
             x, y = batch
             x, y = x.to(device), y.to(device)
@@ -318,7 +416,14 @@ def train_epoch(model, loader, optimizer, criterion, device, use_graph=True):
     return total_loss / num_batches
 
 
-def validate(model, loader, criterion, device, use_graph=True):
+def validate(
+    model,
+    loader,
+    criterion,
+    device,
+    use_graph=True,
+    smoothness_lambda: float = 0.0,
+):
     """Validate model."""
     model.eval()
     total_loss = 0
@@ -330,6 +435,8 @@ def validate(model, loader, criterion, device, use_graph=True):
                 batch = batch.to(device)
                 out = model(batch.x, batch.edge_index)
                 loss = criterion(out, batch.y)
+                if smoothness_lambda and smoothness_lambda > 0:
+                    loss = loss + float(smoothness_lambda) * _graph_smoothness_loss(out, batch.edge_index)
             else:
                 x, y = batch
                 x, y = x.to(device), y.to(device)
@@ -367,13 +474,37 @@ def train_model(config: Dict):
     
     # Create dataset
     use_graph = config['model']['type'] in ['gnn', 'encoder_decoder']
+
+    # Optional: residual learning on-the-fly interpolation path.
+    # - If enabled, the model predicts residual = fine - interpolated
+    # - If residual_normalization enabled, residual targets are normalized by dataset mean/std
+    residual_learning = bool(config.get('training', {}).get('residual_learning', False))
+    residual_normalization = bool(config.get('training', {}).get('residual_normalization', False))
+    residual_norm_eps = float(config.get('training', {}).get('residual_norm_eps', 1e-8))
+    target_mode = 'residual' if residual_learning else 'absolute'
+    if residual_learning:
+        print("Using residual learning: target = fine - interpolated")
+        if residual_normalization:
+            print("Using residual normalization: (residual - mean) / std")
+
+    smoothness_lambda = float(config.get('training', {}).get('smoothness_lambda', 0.0))
+    if smoothness_lambda and smoothness_lambda > 0:
+        if not use_graph:
+            print("WARNING: smoothness_lambda set but model is not graph-based; ignoring smoothness.")
+            smoothness_lambda = 0.0
+        elif not residual_learning:
+            print("WARNING: smoothness_lambda set but residual_learning is false; ignoring smoothness.")
+            smoothness_lambda = 0.0
     dataset = MeshDataset(
         all_data[source_res],
         all_data[target_res],
         use_graph=use_graph,
         k_neighbors=config['model'].get('k_neighbors', 8),
         use_cache=config['data'].get('use_cache', True),
-        cache_dir=config['data'].get('cache_dir', './cache')
+        cache_dir=config['data'].get('cache_dir', './cache'),
+        target_mode=target_mode,
+        residual_normalize=(residual_learning and residual_normalization),
+        residual_norm_eps=residual_norm_eps,
     )
     
     # Split dataset
@@ -457,11 +588,26 @@ def train_model(config: Dict):
         print(f"\nEpoch {epoch + 1}/{num_epochs}")
         
         # Train
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, device, use_graph)
+        train_loss = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            device,
+            use_graph,
+            smoothness_lambda=smoothness_lambda,
+        )
         train_losses.append(train_loss)
         
         # Validate
-        val_loss = validate(model, val_loader, criterion, device, use_graph)
+        val_loss = validate(
+            model,
+            val_loader,
+            criterion,
+            device,
+            use_graph,
+            smoothness_lambda=smoothness_lambda,
+        )
         val_losses.append(val_loss)
         
         # Update learning rate
@@ -478,7 +624,8 @@ def train_model(config: Dict):
                 'optimizer_state_dict': optimizer.state_dict(),
                 'train_loss': train_loss,
                 'val_loss': val_loss,
-                'config': config
+                'config': config,
+                'residual_stats': getattr(dataset, 'residual_stats', None),
             }, output_dir / 'best_model.pt')
             print(f"Saved best model (val_loss: {val_loss:.6f})")
         
@@ -490,6 +637,8 @@ def train_model(config: Dict):
                 'optimizer_state_dict': optimizer.state_dict(),
                 'train_loss': train_loss,
                 'val_loss': val_loss,
+                'config': config,
+                'residual_stats': getattr(dataset, 'residual_stats', None),
             }, output_dir / f'checkpoint_epoch_{epoch + 1}.pt')
     
     # Plot training curves

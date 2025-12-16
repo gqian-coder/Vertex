@@ -305,8 +305,13 @@ def build_knn_graph(coords: np.ndarray, k: int = 8) -> np.ndarray:
     return edge_index
 
 
-def create_graph_data(coords: np.ndarray, features: np.ndarray, 
-                     target: Optional[np.ndarray] = None, k: int = 8) -> Data:
+def create_graph_data(
+    coords: np.ndarray,
+    features: np.ndarray,
+    target: Optional[np.ndarray] = None,
+    k: int = 8,
+    edge_index: Optional[np.ndarray] = None,
+) -> Data:
     """
     Create PyTorch Geometric Data object from mesh data.
     
@@ -319,8 +324,9 @@ def create_graph_data(coords: np.ndarray, features: np.ndarray,
     Returns:
         PyTorch Geometric Data object
     """
-    # Build graph connectivity
-    edge_index = build_knn_graph(coords, k=k)
+    # Build graph connectivity (or reuse precomputed)
+    if edge_index is None:
+        edge_index = build_knn_graph(coords, k=k)
     
     # Concatenate coordinates with features
     x = np.concatenate([coords, features], axis=-1)
