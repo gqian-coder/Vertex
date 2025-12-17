@@ -31,7 +31,13 @@ class MeshDataset(Dataset):
                  target_mode: str = 'absolute',
                  residual_normalize: bool = False,
                  residual_stats: Optional[Dict] = None,
-                 residual_norm_eps: float = 1e-8):
+                 residual_norm_eps: float = 1e-8,
+                 input_normalize: bool = False,
+                 input_stats: Optional[Dict] = None,
+                 input_norm_eps: float = 1e-8,
+                 normalize_coords: bool = False,
+                 coord_stats: Optional[Dict] = None,
+                 coord_norm_eps: float = 1e-8):
         """
         Initialize dataset.
         
@@ -82,6 +88,44 @@ class MeshDataset(Dataset):
                 'std': self._residual_std.tolist(),
                 'eps': self.residual_norm_eps,
             }
+
+        # Optional input normalization (applied to coarse/interpolated field inputs only).
+        self.input_normalize = bool(input_normalize)
+        self.input_norm_eps = float(input_norm_eps)
+        self.input_stats: Optional[Dict] = None
+        self._input_mean: Optional[np.ndarray] = None
+        self._input_std: Optional[np.ndarray] = None
+        if input_stats is not None:
+            mean = np.asarray(input_stats.get('mean', None), dtype=np.float32)
+            std = np.asarray(input_stats.get('std', None), dtype=np.float32)
+            if mean.ndim != 1 or std.ndim != 1:
+                raise ValueError("input_stats['mean'] and ['std'] must be 1D")
+            self._input_mean = mean
+            self._input_std = np.maximum(std, self.input_norm_eps).astype(np.float32)
+            self.input_stats = {
+                'mean': self._input_mean.tolist(),
+                'std': self._input_std.tolist(),
+                'eps': self.input_norm_eps,
+            }
+
+        # Optional coordinate normalization (applied to coords before concatenation).
+        self.normalize_coords = bool(normalize_coords)
+        self.coord_norm_eps = float(coord_norm_eps)
+        self.coord_stats: Optional[Dict] = None
+        self._coord_mean: Optional[np.ndarray] = None
+        self._coord_std: Optional[np.ndarray] = None
+        if coord_stats is not None:
+            mean = np.asarray(coord_stats.get('mean', None), dtype=np.float32)
+            std = np.asarray(coord_stats.get('std', None), dtype=np.float32)
+            if mean.ndim != 1 or std.ndim != 1:
+                raise ValueError("coord_stats['mean'] and ['std'] must be 1D")
+            self._coord_mean = mean
+            self._coord_std = np.maximum(std, self.coord_norm_eps).astype(np.float32)
+            self.coord_stats = {
+                'mean': self._coord_mean.tolist(),
+                'std': self._coord_std.tolist(),
+                'eps': self.coord_norm_eps,
+            }
         
         # Get coordinates
         if interpolated_data is not None:
@@ -103,11 +147,19 @@ class MeshDataset(Dataset):
                 self.coarse_coords = self.coarse_coords[:, :2]
             self.fine_coords = self.fine_coords[:, :2]
 
+        # If coordinate normalization is enabled, compute stats early so that graph construction
+        # (kNN distances) is consistent with the coordinates that will be fed into the model.
+        if self.normalize_coords and self._coord_mean is None:
+            self._compute_coord_stats_from_coords()
+
         # Precompute graph connectivity once (shared across all timesteps)
         self._edge_index = None
         if self.use_graph:
             print(f"    Precomputing kNN graph once (k={self.k_neighbors})...")
-            self._edge_index = build_knn_graph(self.fine_coords, k=self.k_neighbors)
+            coords_for_graph = self.fine_coords
+            if self.normalize_coords:
+                coords_for_graph = (coords_for_graph - self._coord_mean) / self._coord_std
+            self._edge_index = build_knn_graph(coords_for_graph, k=self.k_neighbors)
         
         # Pre-compute and cache all interpolated data
         if interpolated_data is not None:
@@ -120,6 +172,14 @@ class MeshDataset(Dataset):
         # If residual learning + normalization requested, compute stats from dataset unless provided.
         if self.target_mode == 'residual' and self.residual_normalize and self._residual_mean is None:
             self._compute_residual_stats_from_samples()
+
+        # If input normalization requested, compute stats from dataset unless provided.
+        if self.input_normalize and self._input_mean is None:
+            self._compute_input_stats_from_samples()
+
+        # If coordinate normalization requested, compute stats unless provided.
+        if self.normalize_coords and self._coord_mean is None:
+            self._compute_coord_stats_from_coords()
         
         print(f"Dataset created with {len(self.samples)} samples")
 
@@ -160,6 +220,57 @@ class MeshDataset(Dataset):
         print("    Residual normalization enabled")
         print(f"      mean: {self._residual_mean}")
         print(f"      std : {self._residual_std}")
+
+    def _compute_input_stats_from_samples(self) -> None:
+        if not self.samples:
+            raise ValueError("Cannot compute input stats: dataset has no samples")
+
+        # Accumulate per-feature moments over all nodes and timesteps.
+        sum_ = None
+        sumsq = None
+        count = 0
+        for sample in self.samples:
+            x = sample['coarse_interp'].astype(np.float64)
+            if sum_ is None:
+                sum_ = np.sum(x, axis=0)
+                sumsq = np.sum(x ** 2, axis=0)
+            else:
+                sum_ += np.sum(x, axis=0)
+                sumsq += np.sum(x ** 2, axis=0)
+            count += x.shape[0]
+
+        mean = (sum_ / max(count, 1)).astype(np.float32)
+        var = (sumsq / max(count, 1)) - mean.astype(np.float64) ** 2
+        var = np.maximum(var, 0.0)
+        std = np.sqrt(var).astype(np.float32)
+        std = np.maximum(std, self.input_norm_eps).astype(np.float32)
+
+        self._input_mean = mean
+        self._input_std = std
+        self.input_stats = {
+            'mean': self._input_mean.tolist(),
+            'std': self._input_std.tolist(),
+            'eps': self.input_norm_eps,
+        }
+        print("    Input normalization enabled (fields only)")
+        print(f"      mean: {self._input_mean}")
+        print(f"      std : {self._input_std}")
+
+    def _compute_coord_stats_from_coords(self) -> None:
+        coords = np.asarray(self.fine_coords, dtype=np.float64)
+        mean = coords.mean(axis=0).astype(np.float32)
+        std = coords.std(axis=0).astype(np.float32)
+        std = np.maximum(std, self.coord_norm_eps).astype(np.float32)
+        self._coord_mean = mean
+        self._coord_std = std
+        self.coord_stats = {
+            'mean': self._coord_mean.tolist(),
+            'std': self._coord_std.tolist(),
+            'eps': self.coord_norm_eps,
+        }
+        print("    Coordinate normalization enabled")
+        print(f"      mean: {self._coord_mean}")
+        print(f"      std : {self._coord_std}")
     
     def _prepare_samples_with_cache(self, use_cache: bool, cache_dir: str):
         """Prepare all training samples with pre-computed interpolation."""
@@ -349,12 +460,25 @@ class MeshDataset(Dataset):
                 target = (target - self._residual_mean) / self._residual_std
         else:
             target = fine_features
+
+        # Prepare (optionally normalized) model inputs.
+        input_features = coarse_interp
+        if self.input_normalize:
+            if self._input_mean is None or self._input_std is None:
+                raise RuntimeError("Input normalization requested but stats were not computed")
+            input_features = (input_features - self._input_mean) / self._input_std
+
+        coords = self.fine_coords
+        if self.normalize_coords:
+            if self._coord_mean is None or self._coord_std is None:
+                raise RuntimeError("Coordinate normalization requested but stats were not computed")
+            coords = (coords - self._coord_mean) / self._coord_std
         
         if self.use_graph:
             # Create graph data
             data = create_graph_data(
-                self.fine_coords,
-                coarse_interp,
+                coords,
+                input_features,
                 target=target,
                 k=self.k_neighbors,
                 edge_index=self._edge_index
@@ -363,8 +487,8 @@ class MeshDataset(Dataset):
         else:
             # Return as tensors for MLP
             x = torch.cat([
-                torch.FloatTensor(self.fine_coords),
-                torch.FloatTensor(coarse_interp)
+                torch.FloatTensor(coords),
+                torch.FloatTensor(input_features)
             ], dim=-1)
             y = torch.FloatTensor(target)
             return x, y
@@ -495,6 +619,11 @@ def train_model(config: Dict):
         elif not residual_learning:
             print("WARNING: smoothness_lambda set but residual_learning is false; ignoring smoothness.")
             smoothness_lambda = 0.0
+    input_normalization = bool(config.get('training', {}).get('input_normalization', False))
+    input_norm_eps = float(config.get('training', {}).get('input_norm_eps', 1e-8))
+    normalize_coords = bool(config.get('training', {}).get('normalize_coords', False))
+    coord_norm_eps = float(config.get('training', {}).get('coord_norm_eps', 1e-8))
+
     dataset = MeshDataset(
         all_data[source_res],
         all_data[target_res],
@@ -505,6 +634,10 @@ def train_model(config: Dict):
         target_mode=target_mode,
         residual_normalize=(residual_learning and residual_normalization),
         residual_norm_eps=residual_norm_eps,
+        input_normalize=input_normalization,
+        input_norm_eps=input_norm_eps,
+        normalize_coords=normalize_coords,
+        coord_norm_eps=coord_norm_eps,
     )
     
     # Split dataset
@@ -626,6 +759,8 @@ def train_model(config: Dict):
                 'val_loss': val_loss,
                 'config': config,
                 'residual_stats': getattr(dataset, 'residual_stats', None),
+                'input_stats': getattr(dataset, 'input_stats', None),
+                'coord_stats': getattr(dataset, 'coord_stats', None),
             }, output_dir / 'best_model.pt')
             print(f"Saved best model (val_loss: {val_loss:.6f})")
         
@@ -639,6 +774,8 @@ def train_model(config: Dict):
                 'val_loss': val_loss,
                 'config': config,
                 'residual_stats': getattr(dataset, 'residual_stats', None),
+                'input_stats': getattr(dataset, 'input_stats', None),
+                'coord_stats': getattr(dataset, 'coord_stats', None),
             }, output_dir / f'checkpoint_epoch_{epoch + 1}.pt')
     
     # Plot training curves

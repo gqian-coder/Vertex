@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""Evaluate a saved correction-only model on pre-interpolated Exodus data.
+
+Loads:
+- interpolated_file (model input fields already on fine mesh)
+- fine_file (ground-truth)
+
+Computes per-variable, per-timestep errors across all overlapping timesteps,
+accounting for timestep_offset such that fine[t] == interpolated[t + offset].
+
+Outputs a CSV (long format): one row per (timestep, variable, source), where
+source is either:
+- model: model prediction vs fine ground truth
+- interpolated: original interpolated input vs fine ground truth
+"""
+
+import argparse
+import os
+import sys
+from pathlib import Path
+from typing import Dict, List
+
+import numpy as np
+import torch
+import yaml
+
+# Ensure we can import from src/
+REPO_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(REPO_DIR / "src"))
+
+from data_loader import ExodusDataLoader  # noqa: E402
+from train import MeshDataset  # noqa: E402
+from models import build_knn_graph, MeshGNN, MeshEncoderDecoder, SimpleMLP  # noqa: E402
+
+
+VARIABLES_STD = ["velocity_0", "velocity_1", "pressure", "temperature"]
+VARIABLES_FRIENDLY = ["velocity_x", "velocity_y", "pressure", "temperature"]
+
+
+def _load_yaml(path: str) -> Dict:
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+
+
+def _reconstruct_model_from_checkpoint(checkpoint_path: str, device: torch.device):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    if "config" not in checkpoint:
+        raise KeyError(
+            "Checkpoint missing 'config'. Expected a training checkpoint with architecture info."
+        )
+
+    config = checkpoint["config"]
+
+    # Training scripts assume 2D coords after z-drop for 2D meshes.
+    ndim = 2
+    in_channels = ndim + 4
+    out_channels = 4
+
+    model_type = config["model"]["type"]
+    if model_type == "gnn":
+        model = MeshGNN(
+            in_channels=in_channels,
+            hidden_channels=config["model"]["hidden_channels"],
+            out_channels=out_channels,
+            num_layers=config["model"]["num_layers"],
+            dropout=config["model"]["dropout"],
+        )
+    elif model_type == "encoder_decoder":
+        model = MeshEncoderDecoder(
+            in_channels=in_channels,
+            hidden_channels=config["model"]["hidden_channels"],
+            out_channels=out_channels,
+            num_levels=config["model"].get("num_levels", 3),
+            dropout=config["model"]["dropout"],
+        )
+    elif model_type == "mlp":
+        model = SimpleMLP(
+            in_channels=in_channels,
+            hidden_channels=config["model"]["hidden_channels"],
+            out_channels=out_channels,
+            num_layers=config["model"]["num_layers"],
+            dropout=config["model"]["dropout"],
+        )
+    else:
+        raise ValueError(f"Unknown model type in checkpoint config: {model_type}")
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.to(device)
+    model.eval()
+
+    residual_stats = checkpoint.get("residual_stats")
+    input_stats = checkpoint.get("input_stats")
+    coord_stats = checkpoint.get("coord_stats")
+    return model, config, residual_stats, input_stats, coord_stats
+
+
+def _ensure_required_fields(label: str, data: Dict, required: List[str]) -> None:
+    missing = [k for k in required if k not in data.get("fields", {})]
+    if missing:
+        raise ValueError(f"{label} missing required fields: {missing}. Available: {list(data.get('fields', {}).keys())}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate correction model errors per timestep and variable")
+    parser.add_argument(
+        "--config",
+        default=str(REPO_DIR / "config_preinterpolated.yaml"),
+        help="Path to config_preinterpolated.yaml",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        default=str(REPO_DIR / "outputs_correction" / "best_model.pt"),
+        help="Path to trained model checkpoint (best_model.pt)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Directory to write evaluation outputs (default: <checkpoint_dir>/evaluation)",
+    )
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="Device override, e.g. 'cpu' or 'cuda'. Default: auto",
+    )
+    parser.add_argument(
+        "--out-base",
+        default=None,
+        help=(
+            "Base name (no extension) for outputs inside --output-dir. "
+            "If set, writes <out-base>.csv and <out-base>.json instead of default filenames."
+        ),
+    )
+
+    args = parser.parse_args()
+
+    config = _load_yaml(args.config)
+
+    interpolated_file = config["data"]["interpolated_file"]
+    fine_file = config["data"]["fine_file"]
+    timestep_offset = int(config["data"].get("timestep_offset", 0))
+
+    device = (
+        torch.device(args.device)
+        if args.device is not None
+        else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    )
+
+    checkpoint_path = Path(args.checkpoint)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    output_dir = (
+        Path(args.output_dir)
+        if args.output_dir is not None
+        else checkpoint_path.parent / "evaluation"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("Loading model checkpoint...")
+    model, ckpt_config, residual_stats, input_stats, coord_stats = _reconstruct_model_from_checkpoint(str(checkpoint_path), device)
+    use_graph = ckpt_config["model"]["type"] in ["gnn", "encoder_decoder"]
+
+    residual_learning = bool(ckpt_config.get("training", {}).get("residual_learning", False))
+    if residual_learning:
+        print("Checkpoint indicates residual learning: model output is a correction (fine - interpolated)")
+
+    residual_normalization = bool(ckpt_config.get("training", {}).get("residual_normalization", False))
+    input_normalization = bool(ckpt_config.get("training", {}).get("input_normalization", False))
+    normalize_coords = bool(ckpt_config.get("training", {}).get("normalize_coords", False))
+    if residual_learning and residual_normalization:
+        if not residual_stats or ("mean" not in residual_stats) or ("std" not in residual_stats):
+            print(
+                "WARNING: residual_normalization is true but checkpoint missing residual_stats; "
+                "will treat model output as unnormalized correction."
+            )
+            residual_stats = None
+
+    # Helpful sanity check: warn if you're evaluating on different files than the checkpoint was trained on.
+    ckpt_data_cfg = ckpt_config.get("data", {}) if isinstance(ckpt_config, dict) else {}
+    ckpt_interp = ckpt_data_cfg.get("interpolated_file")
+    ckpt_fine = ckpt_data_cfg.get("fine_file")
+    ckpt_offset = ckpt_data_cfg.get("timestep_offset")
+    if ckpt_interp and ckpt_interp != interpolated_file:
+        print(
+            "WARNING: Checkpoint was trained with a different interpolated_file.\n"
+            f"  checkpoint: {ckpt_interp}\n"
+            f"  eval:       {interpolated_file}\n"
+            "This can easily make the model look worse than the baseline interpolation."
+        )
+    if ckpt_fine and ckpt_fine != fine_file:
+        print(
+            "WARNING: Checkpoint was trained with a different fine_file.\n"
+            f"  checkpoint: {ckpt_fine}\n"
+            f"  eval:       {fine_file}\n"
+            "This can easily make the model look worse than the baseline interpolation."
+        )
+    if ckpt_offset is not None and int(ckpt_offset) != timestep_offset:
+        print(
+            "WARNING: Checkpoint timestep_offset differs from evaluation timestep_offset.\n"
+            f"  checkpoint: {int(ckpt_offset)}\n"
+            f"  eval:       {timestep_offset}"
+        )
+
+    print("Loading Exodus data...")
+    with ExodusDataLoader(interpolated_file) as interp_reader:
+        interpolated_data = interp_reader.load()
+    with ExodusDataLoader(fine_file) as fine_reader:
+        fine_data = fine_reader.load()
+
+    _ensure_required_fields("Interpolated data", interpolated_data, VARIABLES_STD)
+    _ensure_required_fields("Fine (ground truth) data", fine_data, VARIABLES_STD)
+
+    # Coordinate alignment check (node ordering must match for pointwise errors to be meaningful)
+    interp_coords = interpolated_data["coordinates"]
+    fine_coords_raw = fine_data["coordinates"]
+    if interp_coords.shape != fine_coords_raw.shape:
+        print(
+            "WARNING: interpolated vs fine coordinate arrays have different shapes. "
+            f"interp={interp_coords.shape}, fine={fine_coords_raw.shape}."
+        )
+    else:
+        # Mirror the training-time 2D detection (drop z if effectively 2D)
+        z_range = float(np.ptp(interp_coords[:, 2])) if interp_coords.shape[1] >= 3 else 0.0
+        if z_range < 1e-6 and interp_coords.shape[1] >= 2:
+            interp_xy = interp_coords[:, :2]
+            fine_xy = fine_coords_raw[:, :2]
+        else:
+            interp_xy = interp_coords
+            fine_xy = fine_coords_raw
+
+        max_abs = float(np.max(np.abs(interp_xy - fine_xy)))
+        mean_abs = float(np.mean(np.abs(interp_xy - fine_xy)))
+        if max_abs > 1e-8:
+            print(
+                "WARNING: interpolated and fine coordinates differ (node ordering mismatch possible).\n"
+                f"  mean|Δcoord|={mean_abs:.3e}, max|Δcoord|={max_abs:.3e}\n"
+                "If ordering differs, both baseline and model errors here are not physically meaningful."
+            )
+
+    k_neighbors = int(ckpt_config["model"].get("k_neighbors", config["model"].get("k_neighbors", 8)))
+
+    print("Building evaluation dataset (pre-interpolated / correction-only)...")
+    dataset = MeshDataset(
+        interpolated_data=interpolated_data,
+        fine_data=fine_data,
+        timestep_offset=timestep_offset,
+        use_graph=use_graph,
+        k_neighbors=k_neighbors,
+        use_cache=False,
+        cache_dir=str(REPO_DIR / "cache"),
+    )
+
+    # Precompute graph connectivity once (same for all timesteps)
+    edge_index_t = None
+    fine_coords = dataset.fine_coords
+
+    fine_coords_in = fine_coords.astype(np.float32)
+    if normalize_coords and coord_stats is not None and ("mean" in coord_stats) and ("std" in coord_stats):
+        cmean = np.asarray(coord_stats["mean"], dtype=np.float32)
+        cstd = np.asarray(coord_stats["std"], dtype=np.float32)
+        fine_coords_in = (fine_coords_in - cmean) / cstd
+
+    if use_graph:
+        print(f"Precomputing kNN graph (k={k_neighbors})...")
+        edge_index = build_knn_graph(fine_coords_in, k=k_neighbors)
+        edge_index_t = torch.as_tensor(edge_index, dtype=torch.long, device=device)
+
+    records = []
+
+    print(f"Evaluating {len(dataset)} timesteps on device={device}...")
+    with torch.no_grad():
+        for i in range(len(dataset)):
+            sample = dataset.samples[i]
+            t_fine = int(sample.get("timestep", i))
+            t_interp = int(sample.get("timestep_interp", t_fine + timestep_offset))
+
+            coarse_interp = sample["coarse_interp"].astype(np.float32)  # (n_nodes, 4)
+            fine_features = sample["fine_features"].astype(np.float32)  # (n_nodes, 4)
+
+            coarse_interp_in = coarse_interp
+            if input_normalization and input_stats is not None and ("mean" in input_stats) and ("std" in input_stats):
+                mean = np.asarray(input_stats["mean"], dtype=np.float32)
+                std = np.asarray(input_stats["std"], dtype=np.float32)
+                coarse_interp_in = (coarse_interp_in - mean) / std
+
+            x_np = np.concatenate([fine_coords_in, coarse_interp_in], axis=-1)
+            x = torch.from_numpy(x_np).to(device)
+
+            if use_graph:
+                pred = model(x, edge_index_t)
+            else:
+                pred = model(x)
+
+            pred_np = pred.detach().cpu().numpy()
+
+            def _add_records(source: str, pred_or_interp: np.ndarray):
+                diff = pred_or_interp - fine_features
+                mse_per_var = np.mean(diff ** 2, axis=0)
+                mae_per_var = np.mean(np.abs(diff), axis=0)
+                rmse_per_var = np.sqrt(mse_per_var)
+
+                for var_idx, (var_std, var_name) in enumerate(
+                    zip(VARIABLES_STD, VARIABLES_FRIENDLY)
+                ):
+                    records.append(
+                        {
+                            "timestep_fine": t_fine,
+                            "timestep_interpolated": t_interp,
+                            "variable": var_name,
+                            "variable_std": var_std,
+                            "source": source,
+                            "mse": float(mse_per_var[var_idx]),
+                            "rmse": float(rmse_per_var[var_idx]),
+                            "mae": float(mae_per_var[var_idx]),
+                        }
+                    )
+
+            # Model prediction vs ground truth
+            # If residual_learning, the model output is a correction, so compare (interpolated + correction) to fine.
+            if residual_learning:
+                correction = pred_np
+                if residual_stats is not None and residual_normalization:
+                    mean = np.asarray(residual_stats["mean"], dtype=np.float32)
+                    std = np.asarray(residual_stats["std"], dtype=np.float32)
+                    correction = correction * std + mean
+                model_fields = coarse_interp + correction
+            else:
+                model_fields = pred_np
+
+            _add_records("model", model_fields)
+            # Baseline: original interpolated values vs ground truth
+            _add_records("interpolated", coarse_interp)
+
+    # Write CSV (long format)
+    if args.out_base:
+        csv_path = output_dir / f"{args.out_base}.csv"
+    else:
+        csv_path = output_dir / "errors_by_variable_and_timestep.csv"
+    try:
+        import pandas as pd  # type: ignore
+
+        df = pd.DataFrame.from_records(records)
+        df = df.sort_values(["timestep_fine", "variable", "source"]).reset_index(drop=True)
+        df.to_csv(csv_path, index=False)
+    except Exception:
+        # Pandas is not listed in requirements; fall back to stdlib CSV.
+        import csv
+
+        fieldnames = [
+            "timestep_fine",
+            "timestep_interpolated",
+            "variable",
+            "variable_std",
+            "source",
+            "mse",
+            "rmse",
+            "mae",
+        ]
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in sorted(
+                records, key=lambda r: (r["timestep_fine"], r["variable"], r["source"])
+            ):
+                writer.writerow({k: row[k] for k in fieldnames})
+
+    # Also write a compact JSON summary (mean across timesteps)
+    summary = {}
+    for source in ["model", "interpolated"]:
+        summary[source] = {}
+        for var in VARIABLES_FRIENDLY:
+            rows = [r for r in records if r["source"] == source and r["variable"] == var]
+            summary[source][var] = {
+                "timesteps": len(rows),
+                "rmse_mean": float(np.mean([r["rmse"] for r in rows])),
+                "mae_mean": float(np.mean([r["mae"] for r in rows])),
+                "mse_mean": float(np.mean([r["mse"] for r in rows])),
+            }
+
+    if args.out_base:
+        summary_path = output_dir / f"{args.out_base}.json"
+    else:
+        summary_path = output_dir / "summary_mean_errors.json"
+    import json
+
+    with open(summary_path, "w") as f:
+        json.dump(
+            {
+                "checkpoint": str(checkpoint_path),
+                "interpolated_file": interpolated_file,
+                "fine_file": fine_file,
+                "timestep_offset": timestep_offset,
+                "use_graph": use_graph,
+                "k_neighbors": k_neighbors,
+                "residual_learning": residual_learning,
+                "residual_normalization": residual_normalization,
+                "residual_stats": residual_stats,
+                "summary": summary,
+            },
+            f,
+            indent=2,
+        )
+
+    print(f"Wrote: {csv_path}")
+    print(f"Wrote: {summary_path}")
+
+
+if __name__ == "__main__":
+    main()

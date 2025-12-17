@@ -21,6 +21,8 @@ def load_model(checkpoint_path: str, device: torch.device):
     checkpoint = torch.load(checkpoint_path, map_location=device)
     config = checkpoint['config']
     residual_stats = checkpoint.get('residual_stats')
+    input_stats = checkpoint.get('input_stats')
+    coord_stats = checkpoint.get('coord_stats')
     
     # Reconstruct model
     ndim = 2  # Assuming 2D
@@ -59,7 +61,7 @@ def load_model(checkpoint_path: str, device: torch.device):
     model.to(device)
     model.eval()
 
-    return model, config, residual_stats
+    return model, config, residual_stats, input_stats, coord_stats
 
 
 def inference(coarse_file: str, fine_coords: np.ndarray, model_path: str, 
@@ -82,10 +84,13 @@ def inference(coarse_file: str, fine_coords: np.ndarray, model_path: str,
     
     # Load model
     print(f"Loading model from {model_path}...")
-    model, config, residual_stats = load_model(model_path, device)
+    model, config, residual_stats, input_stats, coord_stats = load_model(model_path, device)
     use_graph = config['model']['type'] in ['gnn', 'encoder_decoder']
     residual_learning = bool(config.get('training', {}).get('residual_learning', False))
     residual_normalization = bool(config.get('training', {}).get('residual_normalization', False))
+
+    input_normalization = bool(config.get('training', {}).get('input_normalization', False))
+    normalize_coords = bool(config.get('training', {}).get('normalize_coords', False))
     
     # Load coarse data
     print(f"Loading coarse data from {coarse_file}...")
@@ -109,17 +114,31 @@ def inference(coarse_file: str, fine_coords: np.ndarray, model_path: str,
             coarse_features.append(coarse_fields[field_name])
     
     coarse_features = np.stack(coarse_features, axis=-1)
-    coarse_interp = interpolator.interpolate(coarse_features)
+    coarse_interp_raw = interpolator.interpolate(coarse_features).astype(np.float32)
+
+    # Apply the same input normalization used during training (if any)
+    coarse_interp_in = coarse_interp_raw
+    if input_normalization and input_stats is not None and 'mean' in input_stats and 'std' in input_stats:
+        mean = np.asarray(input_stats['mean'], dtype=np.float32)
+        std = np.asarray(input_stats['std'], dtype=np.float32)
+        coarse_interp_in = (coarse_interp_in - mean) / std
+
+    # Apply optional coordinate normalization
+    fine_coords_in = fine_coords
+    if normalize_coords and coord_stats is not None and 'mean' in coord_stats and 'std' in coord_stats:
+        cmean = np.asarray(coord_stats['mean'], dtype=np.float32)
+        cstd = np.asarray(coord_stats['std'], dtype=np.float32)
+        fine_coords_in = (fine_coords.astype(np.float32) - cmean) / cstd
     
     # Prepare input
     if use_graph:
         data = create_graph_data(
-            fine_coords, coarse_interp, 
+            fine_coords_in, coarse_interp_in, 
             k=config['model'].get('k_neighbors', 8)
         )
         data = data.to(device)
     else:
-        x = np.concatenate([fine_coords, coarse_interp], axis=-1)
+        x = np.concatenate([fine_coords_in, coarse_interp_in], axis=-1)
         x = torch.FloatTensor(x).to(device)
     
     # Run inference
@@ -140,7 +159,7 @@ def inference(coarse_file: str, fine_coords: np.ndarray, model_path: str,
             mean = np.asarray(residual_stats['mean'], dtype=np.float32)
             std = np.asarray(residual_stats['std'], dtype=np.float32)
             correction = correction * std + mean
-        prediction = coarse_interp + correction
+        prediction = coarse_interp_raw + correction
     
     # Save predictions
     output_dir = Path(output_dir)
@@ -149,7 +168,7 @@ def inference(coarse_file: str, fine_coords: np.ndarray, model_path: str,
     np.savez(
         output_dir / f'predictions_timestep_{timestep}.npz',
         coordinates=fine_coords,
-        coarse_interpolated=coarse_interp,
+        coarse_interpolated=coarse_interp_raw,
         prediction=prediction,
         correction=correction,
         field_names=field_names
@@ -167,7 +186,7 @@ def inference(coarse_file: str, fine_coords: np.ndarray, model_path: str,
             # Model prediction
             exodus_fields[f'{field_name}_predicted'] = prediction[:, i]
             # Coarse interpolation baseline
-            exodus_fields[f'{field_name}_interpolated'] = coarse_interp[:, i]
+            exodus_fields[f'{field_name}_interpolated'] = coarse_interp_raw[:, i]
             if residual_learning:
                 exodus_fields[f'{field_name}_correction'] = correction[:, i]
         
@@ -184,7 +203,7 @@ def inference(coarse_file: str, fine_coords: np.ndarray, model_path: str,
     # Compute error if ground truth available
     return {
         'coordinates': fine_coords,
-        'coarse_interpolated': coarse_interp,
+        'coarse_interpolated': coarse_interp_raw,
         'prediction': prediction,
         'field_names': field_names
     }

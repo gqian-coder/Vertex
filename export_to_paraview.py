@@ -52,7 +52,7 @@ Then open the .exo file in ParaView to visualize!
                        help='Output ExodusII file path')
     parser.add_argument('--method', type=str, default='linear',
                        choices=['nearest', 'linear', 'rbf'],
-                       help='Interpolation method (default: linear). '\n                            'nearest=fast but blocky; '\n                            'linear=best accuracy/speed (RECOMMENDED); '\n                            'rbf=smooth but slow, auto-subsamples >5K points')
+                       help='Interpolation method (default: linear); rbf=smooth but slow, auto-subsamples >5K points')
     parser.add_argument('--fields', nargs='+', type=str, default=None,
                        help='Specific fields to interpolate (default: all)')
     parser.add_argument('--max-timesteps', type=int, default=None,

@@ -23,6 +23,15 @@ training:
   save_every: 10
   output_dir: './outputs'
 
+  # Optional (recommended for small interpolation error regimes):
+  # Predict corrections instead of absolute fields: residual = fine - interpolated.
+  residual_learning: false
+  # Normalize residual targets by dataset mean/std; stats saved into checkpoints.
+  residual_normalization: false
+  residual_norm_eps: 1.0e-8
+  # Optional graph-smoothness penalty on predicted correction (graph models only, residual_learning only).
+  smoothness_lambda: 0.0
+
 # To train with different settings, modify these parameters:
 # - For coarse -> finest: Change target_resolution to 'finest'
 # - For larger model: Increase hidden_channels and num_layers

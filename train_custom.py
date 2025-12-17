@@ -27,6 +27,11 @@ def train_custom(config_path='config_custom.yaml'):
     
     # Check if using pre-interpolated data
     use_preinterpolated = 'interpolated_file' in config['data']
+
+    input_normalization = bool(config.get('training', {}).get('input_normalization', False))
+    input_norm_eps = float(config.get('training', {}).get('input_norm_eps', 1e-8))
+    normalize_coords = bool(config.get('training', {}).get('normalize_coords', False))
+    coord_norm_eps = float(config.get('training', {}).get('coord_norm_eps', 1e-8))
     
     if use_preinterpolated:
         print(f"Loading pre-interpolated data (correction-only mode)...")
@@ -77,6 +82,10 @@ def train_custom(config_path='config_custom.yaml'):
             target_mode=target_mode,
             residual_normalize=(residual_learning and residual_normalization),
             residual_norm_eps=residual_norm_eps,
+            input_normalize=input_normalization,
+            input_norm_eps=input_norm_eps,
+            normalize_coords=normalize_coords,
+            coord_norm_eps=coord_norm_eps,
         )
     else:
         print(f"Loading data from custom files...")
@@ -100,7 +109,11 @@ def train_custom(config_path='config_custom.yaml'):
             use_graph=use_graph,
             k_neighbors=config['model']['k_neighbors'],
             use_cache=config['data']['use_cache'],
-            cache_dir=config['data']['cache_dir']
+            cache_dir=config['data']['cache_dir'],
+            input_normalize=input_normalization,
+            input_norm_eps=input_norm_eps,
+            normalize_coords=normalize_coords,
+            coord_norm_eps=coord_norm_eps,
         )
 
         # These features are currently only intended for correction/residual training.
@@ -160,7 +173,7 @@ def train_custom(config_path='config_custom.yaml'):
             in_channels=in_channels,
             hidden_channels=config['model']['hidden_channels'],
             out_channels=out_channels,
-            num_levels=config['model'].get('num_levels', 3),
+            num_levels=config['model']['num_layers'],
             dropout=config['model']['dropout']
         )
     else:
@@ -232,6 +245,8 @@ def train_custom(config_path='config_custom.yaml'):
                 'val_loss': val_loss,
                 'config': config,
                 'residual_stats': getattr(dataset, 'residual_stats', None),
+                'input_stats': getattr(dataset, 'input_stats', None),
+                'coord_stats': getattr(dataset, 'coord_stats', None),
             }
             torch.save(
                 checkpoint,
@@ -248,6 +263,8 @@ def train_custom(config_path='config_custom.yaml'):
                 'val_loss': val_loss,
                 'config': config,
                 'residual_stats': getattr(dataset, 'residual_stats', None),
+                'input_stats': getattr(dataset, 'input_stats', None),
+                'coord_stats': getattr(dataset, 'coord_stats', None),
             }
             torch.save(
                 checkpoint,
