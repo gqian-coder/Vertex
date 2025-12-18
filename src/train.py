@@ -37,7 +37,10 @@ class MeshDataset(Dataset):
                  input_norm_eps: float = 1e-8,
                  normalize_coords: bool = False,
                  coord_stats: Optional[Dict] = None,
-                 coord_norm_eps: float = 1e-8):
+                 coord_norm_eps: float = 1e-8,
+                 physics_enabled: bool = False,
+                 physics_boundary_file: Optional[str] = None,
+                 physics_sidesets: Optional[Dict[str, bool]] = None):
         """
         Initialize dataset.
         
@@ -126,6 +129,12 @@ class MeshDataset(Dataset):
                 'std': self._coord_std.tolist(),
                 'eps': self.coord_norm_eps,
             }
+
+        # Optional physics/BC metadata
+        self.physics_enabled = bool(physics_enabled)
+        self.physics_boundary_file = physics_boundary_file
+        self.physics_sidesets = physics_sidesets or {}
+        self.boundary_masks: Dict[str, np.ndarray] = {}
         
         # Get coordinates
         if interpolated_data is not None:
@@ -180,6 +189,23 @@ class MeshDataset(Dataset):
         # If coordinate normalization requested, compute stats unless provided.
         if self.normalize_coords and self._coord_mean is None:
             self._compute_coord_stats_from_coords()
+
+        # Optional: build boundary node masks from a separate Exodus file (typically solution.exo)
+        # This is intentionally best-effort: if it fails, training continues unchanged.
+        if self.physics_enabled and self.physics_boundary_file:
+            try:
+                from model_physics import build_sideset_node_mask
+
+                if self.physics_sidesets.get('cylinder', False):
+                    self.boundary_masks['cylinder'] = build_sideset_node_mask(self.physics_boundary_file, 'cylinder')
+                if self.physics_sidesets.get('inlet', False):
+                    self.boundary_masks['inlet'] = build_sideset_node_mask(self.physics_boundary_file, 'inlet')
+                if self.physics_sidesets.get('outlet', False):
+                    self.boundary_masks['outlet'] = build_sideset_node_mask(self.physics_boundary_file, 'outlet')
+                if self.boundary_masks:
+                    print(f"    Physics boundary masks enabled from: {self.physics_boundary_file}")
+            except Exception as e:
+                print(f"[physics] Warning: failed to build boundary masks from {self.physics_boundary_file}: {e}")
         
         print(f"Dataset created with {len(self.samples)} samples")
 
@@ -452,6 +478,10 @@ class MeshDataset(Dataset):
         coarse_interp = sample['coarse_interp']  # (n_fine_nodes, n_features)
         fine_features = sample['fine_features']  # (n_fine_nodes, n_features)
 
+        # Preserve raw baseline and coordinates for optional physics/BC losses.
+        coarse_interp_raw = torch.FloatTensor(coarse_interp)
+        coords_raw = torch.FloatTensor(self.fine_coords)
+
         if self.target_mode == 'residual':
             target = fine_features - coarse_interp
             if self.residual_normalize:
@@ -483,6 +513,17 @@ class MeshDataset(Dataset):
                 k=self.k_neighbors,
                 edge_index=self._edge_index
             )
+
+            # Optional attributes for physics losses
+            data.coarse_interp_raw = coarse_interp_raw
+            data.coords_raw = coords_raw
+            if self.boundary_masks:
+                if 'cylinder' in self.boundary_masks:
+                    data.mask_cylinder = torch.as_tensor(self.boundary_masks['cylinder'], dtype=torch.bool)
+                if 'inlet' in self.boundary_masks:
+                    data.mask_inlet = torch.as_tensor(self.boundary_masks['inlet'], dtype=torch.bool)
+                if 'outlet' in self.boundary_masks:
+                    data.mask_outlet = torch.as_tensor(self.boundary_masks['outlet'], dtype=torch.bool)
             return data
         else:
             # Return as tensors for MLP
@@ -510,6 +551,9 @@ def train_epoch(
     device,
     use_graph=True,
     smoothness_lambda: float = 0.0,
+    physics_cfg=None,
+    residual_stats: Optional[Dict] = None,
+    residual_learning: bool = False,
 ):
     """Train for one epoch."""
     model.train()
@@ -525,6 +569,13 @@ def train_epoch(
             loss = criterion(out, batch.y)
             if smoothness_lambda and smoothness_lambda > 0:
                 loss = loss + float(smoothness_lambda) * _graph_smoothness_loss(out, batch.edge_index)
+
+            # Optional physics/BC losses (only meaningful in residual/correction mode)
+            if residual_learning and physics_cfg is not None and getattr(physics_cfg, 'enabled', False):
+                from model_physics import physics_loss_from_batch
+
+                phys_loss, _ = physics_loss_from_batch(batch, out, residual_stats=residual_stats, physics_cfg=physics_cfg)
+                loss = loss + phys_loss
         else:
             x, y = batch
             x, y = x.to(device), y.to(device)
@@ -547,6 +598,9 @@ def validate(
     device,
     use_graph=True,
     smoothness_lambda: float = 0.0,
+    physics_cfg=None,
+    residual_stats: Optional[Dict] = None,
+    residual_learning: bool = False,
 ):
     """Validate model."""
     model.eval()
@@ -561,6 +615,12 @@ def validate(
                 loss = criterion(out, batch.y)
                 if smoothness_lambda and smoothness_lambda > 0:
                     loss = loss + float(smoothness_lambda) * _graph_smoothness_loss(out, batch.edge_index)
+
+                if residual_learning and physics_cfg is not None and getattr(physics_cfg, 'enabled', False):
+                    from model_physics import physics_loss_from_batch
+
+                    phys_loss, _ = physics_loss_from_batch(batch, out, residual_stats=residual_stats, physics_cfg=physics_cfg)
+                    loss = loss + phys_loss
             else:
                 x, y = batch
                 x, y = x.to(device), y.to(device)
@@ -624,6 +684,20 @@ def train_model(config: Dict):
     normalize_coords = bool(config.get('training', {}).get('normalize_coords', False))
     coord_norm_eps = float(config.get('training', {}).get('coord_norm_eps', 1e-8))
 
+    # Optional physics/BC constraints (only meaningful for residual learning).
+    from model_physics import physics_config_from_training_cfg
+
+    physics_cfg = physics_config_from_training_cfg(config.get('training', {}))
+    if physics_cfg.enabled and not residual_learning:
+        print("WARNING: training.physics.enabled=true but residual_learning=false; disabling physics losses.")
+        physics_cfg.enabled = False
+
+    phys_sidesets = {}
+    if physics_cfg.enabled:
+        phys_sidesets = (config.get('training', {}).get('physics', {}) or {}).get('sidesets', None)
+        if not isinstance(phys_sidesets, dict) or not phys_sidesets:
+            phys_sidesets = {'cylinder': True}
+
     dataset = MeshDataset(
         all_data[source_res],
         all_data[target_res],
@@ -638,6 +712,9 @@ def train_model(config: Dict):
         input_norm_eps=input_norm_eps,
         normalize_coords=normalize_coords,
         coord_norm_eps=coord_norm_eps,
+        physics_enabled=bool(physics_cfg.enabled),
+        physics_boundary_file=physics_cfg.boundary_file,
+        physics_sidesets=phys_sidesets,
     )
     
     # Split dataset
@@ -729,6 +806,9 @@ def train_model(config: Dict):
             device,
             use_graph,
             smoothness_lambda=smoothness_lambda,
+            physics_cfg=physics_cfg,
+            residual_stats=getattr(dataset, 'residual_stats', None),
+            residual_learning=residual_learning,
         )
         train_losses.append(train_loss)
         
@@ -740,6 +820,9 @@ def train_model(config: Dict):
             device,
             use_graph,
             smoothness_lambda=smoothness_lambda,
+            physics_cfg=physics_cfg,
+            residual_stats=getattr(dataset, 'residual_stats', None),
+            residual_learning=residual_learning,
         )
         val_losses.append(val_loss)
         

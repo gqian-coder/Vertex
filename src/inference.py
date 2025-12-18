@@ -23,6 +23,7 @@ def load_model(checkpoint_path: str, device: torch.device):
     residual_stats = checkpoint.get('residual_stats')
     input_stats = checkpoint.get('input_stats')
     coord_stats = checkpoint.get('coord_stats')
+    state_dict = checkpoint.get('model_state_dict', {})
     
     # Reconstruct model
     ndim = 2  # Assuming 2D
@@ -39,11 +40,35 @@ def load_model(checkpoint_path: str, device: torch.device):
             dropout=config['model']['dropout']
         )
     elif model_type == 'encoder_decoder':
+        # Infer architecture from weights if config is missing/incorrect.
+        def _infer_num_levels(sd):
+            max_idx = -1
+            for k in sd.keys():
+                if k.startswith('encoders.'):
+                    parts = k.split('.')
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        max_idx = max(max_idx, int(parts[1]))
+            return (max_idx + 1) if max_idx >= 0 else 3
+
+        def _infer_hidden(sd):
+            w = sd.get('encoders.0.0.weight')
+            if w is None:
+                return int(config['model'].get('hidden_channels', 128))
+            return int(w.shape[0])
+
+        inferred_levels = _infer_num_levels(state_dict)
+        inferred_hidden = _infer_hidden(state_dict)
+        num_levels = int(config['model'].get('num_levels', inferred_levels))
+        hidden_channels = int(config['model'].get('hidden_channels', inferred_hidden))
+        if num_levels != inferred_levels or hidden_channels != inferred_hidden:
+            num_levels = inferred_levels
+            hidden_channels = inferred_hidden
+
         model = MeshEncoderDecoder(
             in_channels=in_channels,
-            hidden_channels=config['model']['hidden_channels'],
+            hidden_channels=hidden_channels,
             out_channels=out_channels,
-            num_levels=config['model'].get('num_levels', 3),
+            num_levels=num_levels,
             dropout=config['model']['dropout']
         )
     elif model_type == 'mlp':
@@ -57,7 +82,7 @@ def load_model(checkpoint_path: str, device: torch.device):
     else:
         raise ValueError(f"Unknown model type: {model_type}")
     
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
 

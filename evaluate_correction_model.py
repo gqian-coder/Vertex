@@ -51,6 +51,7 @@ def _reconstruct_model_from_checkpoint(checkpoint_path: str, device: torch.devic
         )
 
     config = checkpoint["config"]
+    state_dict = checkpoint.get("model_state_dict", {})
 
     # Training scripts assume 2D coords after z-drop for 2D meshes.
     ndim = 2
@@ -58,6 +59,24 @@ def _reconstruct_model_from_checkpoint(checkpoint_path: str, device: torch.devic
     out_channels = 4
 
     model_type = config["model"]["type"]
+
+    def _infer_encoder_decoder_num_levels(sd: Dict) -> int:
+        max_idx = -1
+        for k in sd.keys():
+            if k.startswith("encoders."):
+                # Format: encoders.<i>.<...>
+                parts = k.split(".")
+                if len(parts) >= 2 and parts[1].isdigit():
+                    max_idx = max(max_idx, int(parts[1]))
+        return (max_idx + 1) if max_idx >= 0 else 3
+
+    def _infer_encoder_decoder_hidden_channels(sd: Dict) -> int:
+        # encoders.0.0.weight is Linear(out_features=hidden_channels, in_features=in_channels)
+        w = sd.get("encoders.0.0.weight")
+        if w is None:
+            return int(config["model"].get("hidden_channels", 128))
+        # torch tensor shape [out, in]
+        return int(w.shape[0])
     if model_type == "gnn":
         model = MeshGNN(
             in_channels=in_channels,
@@ -67,11 +86,22 @@ def _reconstruct_model_from_checkpoint(checkpoint_path: str, device: torch.devic
             dropout=config["model"]["dropout"],
         )
     elif model_type == "encoder_decoder":
+        # Some older checkpoints/configs may not include num_levels (and/or may have drift).
+        # Infer from the state_dict so we can reliably reload.
+        inferred_levels = _infer_encoder_decoder_num_levels(state_dict)
+        inferred_hidden = _infer_encoder_decoder_hidden_channels(state_dict)
+        num_levels = int(config["model"].get("num_levels", inferred_levels))
+        hidden_channels = int(config["model"].get("hidden_channels", inferred_hidden))
+        if num_levels != inferred_levels or hidden_channels != inferred_hidden:
+            # Prefer the weights' implied architecture over the config to avoid load failures.
+            num_levels = inferred_levels
+            hidden_channels = inferred_hidden
+
         model = MeshEncoderDecoder(
             in_channels=in_channels,
-            hidden_channels=config["model"]["hidden_channels"],
+            hidden_channels=hidden_channels,
             out_channels=out_channels,
-            num_levels=config["model"].get("num_levels", 3),
+            num_levels=num_levels,
             dropout=config["model"]["dropout"],
         )
     elif model_type == "mlp":
@@ -85,7 +115,7 @@ def _reconstruct_model_from_checkpoint(checkpoint_path: str, device: torch.devic
     else:
         raise ValueError(f"Unknown model type in checkpoint config: {model_type}")
 
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
 
@@ -130,6 +160,25 @@ def main():
             "Base name (no extension) for outputs inside --output-dir. "
             "If set, writes <out-base>.csv and <out-base>.json instead of default filenames."
         ),
+    )
+
+    parser.add_argument(
+        "--start",
+        type=int,
+        default=0,
+        help="Start timestep index within the overlapped evaluation set (default: 0)",
+    )
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=1,
+        help="Evaluate every Nth timestep (default: 1)",
+    )
+    parser.add_argument(
+        "--max-timesteps",
+        type=int,
+        default=None,
+        help="Maximum number of timesteps to evaluate after applying start/stride (default: all)",
     )
 
     args = parser.parse_args()
@@ -268,9 +317,20 @@ def main():
 
     records = []
 
-    print(f"Evaluating {len(dataset)} timesteps on device={device}...")
+    start = int(args.start)
+    stride = max(int(args.stride), 1)
+    if start < 0:
+        raise ValueError("--start must be >= 0")
+    if start >= len(dataset):
+        raise ValueError(f"--start={start} is out of range for dataset length {len(dataset)}")
+
+    indices = list(range(start, len(dataset), stride))
+    if args.max_timesteps is not None:
+        indices = indices[: int(args.max_timesteps)]
+
+    print(f"Evaluating {len(indices)}/{len(dataset)} timesteps on device={device} (start={start}, stride={stride})...")
     with torch.no_grad():
-        for i in range(len(dataset)):
+        for i in indices:
             sample = dataset.samples[i]
             t_fine = int(sample.get("timestep", i))
             t_interp = int(sample.get("timestep_interp", t_fine + timestep_offset))

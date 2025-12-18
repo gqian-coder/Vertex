@@ -16,6 +16,7 @@ from data_loader import ExodusDataLoader
 from train import MeshDataset, train_epoch, validate
 from models import MeshGNN, SimpleMLP, MeshEncoderDecoder
 import numpy as np
+from model_physics import physics_config_from_training_cfg
 
 
 def train_custom(config_path='config_custom.yaml'):
@@ -28,7 +29,7 @@ def train_custom(config_path='config_custom.yaml'):
     # Check if using pre-interpolated data
     use_preinterpolated = 'interpolated_file' in config['data']
 
-    input_normalization = bool(config.get('training', {}).get('input_normalization', False))
+    input_normalization = bool(config.get('training', {}).get('input_normalization', True))
     input_norm_eps = float(config.get('training', {}).get('input_norm_eps', 1e-8))
     normalize_coords = bool(config.get('training', {}).get('normalize_coords', False))
     coord_norm_eps = float(config.get('training', {}).get('coord_norm_eps', 1e-8))
@@ -56,6 +57,20 @@ def train_custom(config_path='config_custom.yaml'):
         target_mode = 'residual' if residual_learning else 'absolute'
         if residual_learning:
             print("Using residual learning: target = fine - interpolated")
+
+        # Optional physics/BC constraints (only supported for residual/correction training)
+        physics_cfg = physics_config_from_training_cfg(config.get('training', {}))
+        if physics_cfg.enabled and not residual_learning:
+            print("WARNING: training.physics.enabled=true but residual_learning=false; disabling physics losses.")
+            physics_cfg.enabled = False
+
+        # Which side sets to use for node masks
+        phys_sidesets = {}
+        if physics_cfg.enabled:
+            phys_sidesets = (config.get('training', {}).get('physics', {}) or {}).get('sidesets', None)
+            if not isinstance(phys_sidesets, dict) or not phys_sidesets:
+                # Default to cylinder mask if any cylinder BC term is used.
+                phys_sidesets = {'cylinder': True}
 
         residual_normalization = bool(config.get('training', {}).get('residual_normalization', False))
         residual_norm_eps = float(config.get('training', {}).get('residual_norm_eps', 1e-8))
@@ -86,6 +101,9 @@ def train_custom(config_path='config_custom.yaml'):
             input_norm_eps=input_norm_eps,
             normalize_coords=normalize_coords,
             coord_norm_eps=coord_norm_eps,
+            physics_enabled=bool(physics_cfg.enabled),
+            physics_boundary_file=physics_cfg.boundary_file,
+            physics_sidesets=phys_sidesets,
         )
     else:
         print(f"Loading data from custom files...")
@@ -118,6 +136,10 @@ def train_custom(config_path='config_custom.yaml'):
 
         # These features are currently only intended for correction/residual training.
         smoothness_lambda = 0.0
+        physics_cfg = physics_config_from_training_cfg(config.get('training', {}))
+        if physics_cfg.enabled:
+            print("WARNING: physics losses are currently only supported for pre-interpolated residual training; disabling.")
+            physics_cfg.enabled = False
     
     print(f"Dataset size: {len(dataset)} timesteps")
     
@@ -217,6 +239,9 @@ def train_custom(config_path='config_custom.yaml'):
             device,
             use_graph,
             smoothness_lambda=smoothness_lambda,
+            physics_cfg=physics_cfg,
+            residual_stats=getattr(dataset, 'residual_stats', None),
+            residual_learning=residual_learning,
         )
         
         # Validate
@@ -227,6 +252,9 @@ def train_custom(config_path='config_custom.yaml'):
             device,
             use_graph,
             smoothness_lambda=smoothness_lambda,
+            physics_cfg=physics_cfg,
+            residual_stats=getattr(dataset, 'residual_stats', None),
+            residual_learning=residual_learning,
         )
         
         # Learning rate scheduling
