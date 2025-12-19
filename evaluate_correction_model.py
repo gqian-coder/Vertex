@@ -214,9 +214,24 @@ def main():
     if residual_learning:
         print("Checkpoint indicates residual learning: model output is a correction (fine - interpolated)")
 
-    residual_normalization = bool(ckpt_config.get("training", {}).get("residual_normalization", False))
-    input_normalization = bool(ckpt_config.get("training", {}).get("input_normalization", False))
-    normalize_coords = bool(ckpt_config.get("training", {}).get("normalize_coords", False))
+    training_cfg = ckpt_config.get("training", {}) if isinstance(ckpt_config, dict) else {}
+    if not isinstance(training_cfg, dict):
+        training_cfg = {}
+
+    residual_normalization = bool(training_cfg.get("residual_normalization", False))
+
+    # Backward/robust behavior:
+    # - Some training entrypoints historically defaulted input_normalization=True but did not persist
+    #   the flag into the saved config. In that case, input_stats will be present in the checkpoint.
+    if "input_normalization" in training_cfg:
+        input_normalization = bool(training_cfg.get("input_normalization"))
+    else:
+        input_normalization = input_stats is not None
+
+    if "normalize_coords" in training_cfg:
+        normalize_coords = bool(training_cfg.get("normalize_coords"))
+    else:
+        normalize_coords = coord_stats is not None
     if residual_learning and residual_normalization:
         if not residual_stats or ("mean" not in residual_stats) or ("std" not in residual_stats):
             print(

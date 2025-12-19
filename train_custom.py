@@ -33,6 +33,13 @@ def train_custom(config_path='config_custom.yaml'):
     input_norm_eps = float(config.get('training', {}).get('input_norm_eps', 1e-8))
     normalize_coords = bool(config.get('training', {}).get('normalize_coords', False))
     coord_norm_eps = float(config.get('training', {}).get('coord_norm_eps', 1e-8))
+
+    # Persist effective settings so they get captured in checkpoints.
+    config.setdefault('training', {})
+    config['training']['input_normalization'] = input_normalization
+    config['training']['input_norm_eps'] = input_norm_eps
+    config['training']['normalize_coords'] = normalize_coords
+    config['training']['coord_norm_eps'] = coord_norm_eps
     
     if use_preinterpolated:
         print(f"Loading pre-interpolated data (correction-only mode)...")
