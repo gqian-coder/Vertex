@@ -1,0 +1,63 @@
+# Training configuration using pre-interpolated data (correction-only mode)
+# Adds optional physics/BC constraints to the loss (opt-in)
+
+data:
+  interpolated_file: '/home/qg7/Vertex/paraview/90-30_to_360-120_interpolated_linear.exo'
+  fine_file: '/home/qg7/Vertex/dataset/002-Re-148_3-AC-beta-10000-Helios/360-120/cropped.e'
+
+  # IMPORTANT: interpolated[t + offset] = fine[t]
+  timestep_offset: 9
+
+  use_cache: false
+  cache_dir: './cache'
+
+model:
+  type: 'encoder_decoder'
+  hidden_channels: 96
+  num_layers: 4
+  dropout: 0.1
+  k_neighbors: 12
+
+training:
+  batch_size: 1
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  num_epochs: 120
+  save_every: 10
+  output_dir: './outputs_correction_physics'
+  validation_split: 0.2
+
+  residual_learning: true
+  residual_normalization: true
+  residual_norm_eps: 1.0e-8
+
+  # Strongly recommended when mixing variables with different magnitudes
+  input_normalization: true
+  input_norm_eps: 1.0e-8
+
+  # Keep as you had it
+  smoothness_lambda: 1.0e-4
+
+  # Physics/BC constraints (OPTIONAL)
+  # Note: cropped.e has no sidesets; use solution.exo (has inlet/outlet/cylinder)
+  physics:
+    enabled: true
+    boundary_file: '/home/qg7/Vertex/dataset/002-Re-148_3-AC-beta-10000-Helios/360-120/solution.exo'
+
+    # Which named sidesets to turn into node masks (if present)
+    sidesets:
+      cylinder: true
+      inlet: false
+      outlet: false
+
+    # Loss weights (starting point)
+    # Based on measured scales on this dataset (normalized residual MSE ~1.07):
+    # - cylinder mean(|u|^2) ~ 8.4e-5  => lambda ~ O(1e3) makes no-slip matter
+    # - mean(div^2) ~ 0.77            => lambda ~ O(1e-1) makes divergence matter
+    # Start smaller for stability, then ramp up if needed.
+    divergence_lambda: 0.03
+    cylinder_no_slip_lambda: 300.0
+
+    # Optional fixed wall temperature enforcement (disabled by default)
+    # cylinder_temperature_lambda: 0.0
+    # cylinder_temperature_value: 298.1515
