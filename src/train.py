@@ -194,14 +194,43 @@ class MeshDataset(Dataset):
         # This is intentionally best-effort: if it fails, training continues unchanged.
         if self.physics_enabled and self.physics_boundary_file:
             try:
-                from model_physics import build_sideset_node_mask
+                from model_physics import (
+                    build_sideset_node_mask,
+                    read_exodus_coords,
+                    transfer_mask_by_coords_best_effort,
+                )
 
+                src_coords = None
                 if self.physics_sidesets.get('cylinder', False):
                     self.boundary_masks['cylinder'] = build_sideset_node_mask(self.physics_boundary_file, 'cylinder')
                 if self.physics_sidesets.get('inlet', False):
                     self.boundary_masks['inlet'] = build_sideset_node_mask(self.physics_boundary_file, 'inlet')
                 if self.physics_sidesets.get('outlet', False):
                     self.boundary_masks['outlet'] = build_sideset_node_mask(self.physics_boundary_file, 'outlet')
+
+                # If boundary mesh differs (e.g., solution.exo vs cropped.e), transfer masks by coord matching.
+                num_nodes = int(self.fine_coords.shape[0])
+                for name, mask in list(self.boundary_masks.items()):
+                    if mask.shape[0] == num_nodes:
+                        continue
+                    if src_coords is None:
+                        src_coords = read_exodus_coords(self.physics_boundary_file)
+                    try:
+                        dst_mask, frac, dec = transfer_mask_by_coords_best_effort(
+                            src_coords,
+                            mask,
+                            self.fine_coords,
+                            decimals_list=(8, 7, 6, 5),
+                            min_match_fraction=0.98,
+                        )
+                        self.boundary_masks[name] = dst_mask
+                        print(
+                            f"    [physics] Transferred mask '{name}' from {mask.shape[0]} -> {num_nodes} nodes "
+                            f"(match={frac:.4f}, decimals={dec})"
+                        )
+                    except Exception as e:
+                        print(f"    [physics] Warning: could not transfer mask '{name}' to training mesh: {e}")
+                        del self.boundary_masks[name]
                 if self.boundary_masks:
                     print(f"    Physics boundary masks enabled from: {self.physics_boundary_file}")
             except Exception as e:
