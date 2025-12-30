@@ -29,6 +29,7 @@ class MeshDataset(Dataset):
                  use_graph: bool = True, k_neighbors: int = 8,
                  use_cache: bool = True, cache_dir: str = './cache',
                  target_mode: str = 'absolute',
+                 input_feature_indices: Optional[List[int]] = None,
                  residual_normalize: bool = False,
                  residual_stats: Optional[Dict] = None,
                  residual_norm_eps: float = 1e-8,
@@ -73,6 +74,13 @@ class MeshDataset(Dataset):
             raise ValueError(f"Unknown target_mode: {target_mode} (expected 'absolute' or 'residual')")
         self.target_mode = target_mode
 
+        # Input feature selection.
+        # By default, drop temperature from model inputs: use [velocity_x, velocity_y, pressure].
+        # Assumes the stacked field order is [vx, vy, p, T].
+        if input_feature_indices is None:
+            input_feature_indices = [0, 1, 2]
+        self.input_feature_indices = [int(i) for i in input_feature_indices]
+
         self.residual_normalize = bool(residual_normalize)
         self.residual_norm_eps = float(residual_norm_eps)
         self.residual_stats: Optional[Dict] = None
@@ -103,6 +111,11 @@ class MeshDataset(Dataset):
             std = np.asarray(input_stats.get('std', None), dtype=np.float32)
             if mean.ndim != 1 or std.ndim != 1:
                 raise ValueError("input_stats['mean'] and ['std'] must be 1D")
+            if mean.shape[0] != len(self.input_feature_indices) or std.shape[0] != len(self.input_feature_indices):
+                raise ValueError(
+                    f"input_stats length mismatch: expected {len(self.input_feature_indices)} (from input_feature_indices), "
+                    f"got mean={mean.shape[0]} std={std.shape[0]}"
+                )
             self._input_mean = mean
             self._input_std = np.maximum(std, self.input_norm_eps).astype(np.float32)
             self.input_stats = {
@@ -285,7 +298,7 @@ class MeshDataset(Dataset):
         sumsq = None
         count = 0
         for sample in self.samples:
-            x = sample['coarse_interp'].astype(np.float64)
+            x = sample['coarse_interp'][:, self.input_feature_indices].astype(np.float64)
             if sum_ is None:
                 sum_ = np.sum(x, axis=0)
                 sumsq = np.sum(x ** 2, axis=0)
@@ -521,7 +534,7 @@ class MeshDataset(Dataset):
             target = fine_features
 
         # Prepare (optionally normalized) model inputs.
-        input_features = coarse_interp
+        input_features = coarse_interp[:, self.input_feature_indices]
         if self.input_normalize:
             if self._input_mean is None or self._input_std is None:
                 raise RuntimeError("Input normalization requested but stats were not computed")
@@ -586,8 +599,16 @@ def train_epoch(
 ):
     """Train for one epoch."""
     model.train()
-    total_loss = 0
+    total_loss = 0.0
     num_batches = 0
+
+    # Component logging (averaged over batches)
+    total_data_loss = 0.0
+    total_smooth_loss = 0.0
+    total_phys_loss = 0.0
+    total_phys_div = 0.0
+    total_phys_cyl_ns = 0.0
+    total_phys_cyl_t = 0.0
     
     for batch in tqdm(loader, desc="Training"):
         optimizer.zero_grad()
@@ -595,29 +616,71 @@ def train_epoch(
         if use_graph:
             batch = batch.to(device)
             out = model(batch.x, batch.edge_index)
-            loss = criterion(out, batch.y)
+            data_loss = criterion(out, batch.y)
+            loss = data_loss
             if smoothness_lambda and smoothness_lambda > 0:
-                loss = loss + float(smoothness_lambda) * _graph_smoothness_loss(out, batch.edge_index)
+                smooth_raw = _graph_smoothness_loss(out, batch.edge_index)
+                smooth_loss = float(smoothness_lambda) * smooth_raw
+                loss = loss + smooth_loss
+            else:
+                smooth_loss = 0.0
+
+            phys_loss_val = 0.0
 
             # Optional physics/BC losses (only meaningful in residual/correction mode)
             if residual_learning and physics_cfg is not None and getattr(physics_cfg, 'enabled', False):
                 from model_physics import physics_loss_from_batch
 
-                phys_loss, _ = physics_loss_from_batch(batch, out, residual_stats=residual_stats, physics_cfg=physics_cfg)
+                phys_loss, phys_logs = physics_loss_from_batch(
+                    batch,
+                    out,
+                    residual_stats=residual_stats,
+                    physics_cfg=physics_cfg,
+                )
                 loss = loss + phys_loss
+                phys_loss_val = float(phys_loss.detach().cpu())
+                total_phys_div += float(phys_logs.get('div', 0.0))
+                total_phys_cyl_ns += float(phys_logs.get('cylinder_no_slip', 0.0))
+                total_phys_cyl_t += float(phys_logs.get('cylinder_temperature', 0.0))
         else:
             x, y = batch
             x, y = x.to(device), y.to(device)
             out = model(x)
-            loss = criterion(out, y)
+            data_loss = criterion(out, y)
+            loss = data_loss
+            smooth_loss = 0.0
+            phys_loss_val = 0.0
         
         loss.backward()
         optimizer.step()
         
-        total_loss += loss.item()
+        total_loss += float(loss.item())
+        total_data_loss += float(data_loss.item())
+        total_smooth_loss += float(smooth_loss) if not isinstance(smooth_loss, torch.Tensor) else float(smooth_loss.detach().cpu())
+        total_phys_loss += float(phys_loss_val)
         num_batches += 1
     
-    return total_loss / num_batches
+    avg_total = total_loss / max(num_batches, 1)
+    avg_data = total_data_loss / max(num_batches, 1)
+    avg_smooth = total_smooth_loss / max(num_batches, 1)
+    avg_phys = total_phys_loss / max(num_batches, 1)
+
+    if use_graph and (avg_smooth > 0.0 or avg_phys > 0.0):
+        msg = f"  [train loss] total={avg_total:.6g} data={avg_data:.6g}"
+        if avg_smooth > 0.0:
+            msg += f" smooth={avg_smooth:.6g}"
+        if avg_phys > 0.0:
+            msg += f" phys={avg_phys:.6g}"
+            # Raw (unweighted) physics diagnostics
+            msg += (
+                f" | phys_raw: div={total_phys_div / max(num_batches,1):.3g}"
+                f" cyl_no_slip={total_phys_cyl_ns / max(num_batches,1):.3g}"
+            )
+            if (total_phys_cyl_t / max(num_batches, 1)) > 0:
+                msg += f" cyl_temp={total_phys_cyl_t / max(num_batches,1):.3g}"
+        print(msg)
+
+    return avg_total
 
 
 def validate(
@@ -633,33 +696,81 @@ def validate(
 ):
     """Validate model."""
     model.eval()
-    total_loss = 0
+    total_loss = 0.0
     num_batches = 0
+
+    total_data_loss = 0.0
+    total_smooth_loss = 0.0
+    total_phys_loss = 0.0
+    total_phys_div = 0.0
+    total_phys_cyl_ns = 0.0
+    total_phys_cyl_t = 0.0
     
     with torch.no_grad():
         for batch in loader:
             if use_graph:
                 batch = batch.to(device)
                 out = model(batch.x, batch.edge_index)
-                loss = criterion(out, batch.y)
+                data_loss = criterion(out, batch.y)
+                loss = data_loss
                 if smoothness_lambda and smoothness_lambda > 0:
-                    loss = loss + float(smoothness_lambda) * _graph_smoothness_loss(out, batch.edge_index)
+                    smooth_raw = _graph_smoothness_loss(out, batch.edge_index)
+                    smooth_loss = float(smoothness_lambda) * smooth_raw
+                    loss = loss + smooth_loss
+                else:
+                    smooth_loss = 0.0
+
+                phys_loss_val = 0.0
 
                 if residual_learning and physics_cfg is not None and getattr(physics_cfg, 'enabled', False):
                     from model_physics import physics_loss_from_batch
 
-                    phys_loss, _ = physics_loss_from_batch(batch, out, residual_stats=residual_stats, physics_cfg=physics_cfg)
+                    phys_loss, phys_logs = physics_loss_from_batch(
+                        batch,
+                        out,
+                        residual_stats=residual_stats,
+                        physics_cfg=physics_cfg,
+                    )
                     loss = loss + phys_loss
+                    phys_loss_val = float(phys_loss.detach().cpu())
+                    total_phys_div += float(phys_logs.get('div', 0.0))
+                    total_phys_cyl_ns += float(phys_logs.get('cylinder_no_slip', 0.0))
+                    total_phys_cyl_t += float(phys_logs.get('cylinder_temperature', 0.0))
             else:
                 x, y = batch
                 x, y = x.to(device), y.to(device)
                 out = model(x)
-                loss = criterion(out, y)
+                data_loss = criterion(out, y)
+                loss = data_loss
+                smooth_loss = 0.0
+                phys_loss_val = 0.0
             
-            total_loss += loss.item()
+            total_loss += float(loss.item())
+            total_data_loss += float(data_loss.item())
+            total_smooth_loss += float(smooth_loss) if not isinstance(smooth_loss, torch.Tensor) else float(smooth_loss.detach().cpu())
+            total_phys_loss += float(phys_loss_val)
             num_batches += 1
     
-    return total_loss / num_batches
+    avg_total = total_loss / max(num_batches, 1)
+    avg_data = total_data_loss / max(num_batches, 1)
+    avg_smooth = total_smooth_loss / max(num_batches, 1)
+    avg_phys = total_phys_loss / max(num_batches, 1)
+
+    if use_graph and (avg_smooth > 0.0 or avg_phys > 0.0):
+        msg = f"  [val loss] total={avg_total:.6g} data={avg_data:.6g}"
+        if avg_smooth > 0.0:
+            msg += f" smooth={avg_smooth:.6g}"
+        if avg_phys > 0.0:
+            msg += f" phys={avg_phys:.6g}"
+            msg += (
+                f" | phys_raw: div={total_phys_div / max(num_batches,1):.3g}"
+                f" cyl_no_slip={total_phys_cyl_ns / max(num_batches,1):.3g}"
+            )
+            if (total_phys_cyl_t / max(num_batches, 1)) > 0:
+                msg += f" cyl_temp={total_phys_cyl_t / max(num_batches,1):.3g}"
+        print(msg)
+
+    return avg_total
 
 
 def train_model(config: Dict):
@@ -727,6 +838,11 @@ def train_model(config: Dict):
         if not isinstance(phys_sidesets, dict) or not phys_sidesets:
             phys_sidesets = {'cylinder': True}
 
+    # By default, drop temperature from model inputs.
+    input_feature_indices = config.get('training', {}).get('input_feature_indices', [0, 1, 2])
+    config.setdefault('training', {})
+    config['training']['input_feature_indices'] = list(input_feature_indices)
+
     dataset = MeshDataset(
         all_data[source_res],
         all_data[target_res],
@@ -735,6 +851,7 @@ def train_model(config: Dict):
         use_cache=config['data'].get('use_cache', True),
         cache_dir=config['data'].get('cache_dir', './cache'),
         target_mode=target_mode,
+        input_feature_indices=input_feature_indices,
         residual_normalize=(residual_learning and residual_normalization),
         residual_norm_eps=residual_norm_eps,
         input_normalize=input_normalization,
@@ -765,8 +882,9 @@ def train_model(config: Dict):
     
     # Create model
     print("\nCreating model...")
-    ndim = all_data[target_res]['coordinates'].shape[1]
-    in_channels = ndim + 4  # coordinates + 4 fields
+    ndim = int(getattr(dataset, 'fine_coords').shape[1])
+    n_input_fields = len(getattr(dataset, 'input_feature_indices', [0, 1, 2]))
+    in_channels = ndim + n_input_fields  # coordinates + selected fields
     out_channels = 4  # 4 fields
     
     model_type = config['model']['type']

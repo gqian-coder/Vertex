@@ -40,6 +40,10 @@ def train_custom(config_path='config_custom.yaml'):
     config['training']['input_norm_eps'] = input_norm_eps
     config['training']['normalize_coords'] = normalize_coords
     config['training']['coord_norm_eps'] = coord_norm_eps
+
+    # Default: drop temperature from model inputs (use vx, vy, p).
+    input_feature_indices = config.get('training', {}).get('input_feature_indices', [0, 1, 2])
+    config['training']['input_feature_indices'] = list(input_feature_indices)
     
     if use_preinterpolated:
         print(f"Loading pre-interpolated data (correction-only mode)...")
@@ -102,6 +106,7 @@ def train_custom(config_path='config_custom.yaml'):
             use_cache=config['data'].get('use_cache', True),
             cache_dir=config['data'].get('cache_dir', './cache'),
             target_mode=target_mode,
+            input_feature_indices=input_feature_indices,
             residual_normalize=(residual_learning and residual_normalization),
             residual_norm_eps=residual_norm_eps,
             input_normalize=input_normalization,
@@ -135,6 +140,7 @@ def train_custom(config_path='config_custom.yaml'):
             k_neighbors=config['model']['k_neighbors'],
             use_cache=config['data']['use_cache'],
             cache_dir=config['data']['cache_dir'],
+            input_feature_indices=input_feature_indices,
             input_normalize=input_normalization,
             input_norm_eps=input_norm_eps,
             normalize_coords=normalize_coords,
@@ -176,8 +182,9 @@ def train_custom(config_path='config_custom.yaml'):
     )
     
     # Create model
-    ndim = 2  # 2D coordinates
-    in_channels = ndim + 4  # coords + 4 fields
+    ndim = int(getattr(dataset, 'fine_coords').shape[1])
+    n_input_fields = len(getattr(dataset, 'input_feature_indices', [0, 1, 2]))
+    in_channels = ndim + n_input_fields  # coords + selected fields
     out_channels = 4
     
     model_type = config['model']['type']

@@ -6,7 +6,7 @@ data:
   fine_file: '/home/qg7/Vertex/dataset/002-Re-148_3-AC-beta-10000-Helios/360-120/cropped.e'
 
   # IMPORTANT: interpolated[t + offset] = fine[t]
-  timestep_offset: 9
+  timestep_offset: 8
 
   use_cache: false
   cache_dir: './cache'
@@ -22,7 +22,7 @@ training:
   batch_size: 1
   learning_rate: 0.001
   weight_decay: 0.00001
-  num_epochs: 120
+  num_epochs: 200
   save_every: 10
   output_dir: './outputs_correction_physics'
   validation_split: 0.2
@@ -51,12 +51,12 @@ training:
       outlet: false
 
     # Loss weights (starting point)
-    # Based on measured scales on this dataset (normalized residual MSE ~1.07):
-    # - cylinder mean(|u|^2) ~ 8.4e-5  => lambda ~ O(1e3) makes no-slip matter
-    # - mean(div^2) ~ 0.77            => lambda ~ O(1e-1) makes divergence matter
-    # Start smaller for stability, then ramp up if needed.
-    divergence_lambda: 0.03
-    cylinder_no_slip_lambda: 300.0
+    # Based on measured scales for this case with timestep_offset=8
+    # (baseline normalized residual MSE ~0.66):
+    # - cylinder mean(|u|^2) ~ 8.4e-5  => lambda ~ O(1e3)
+    # - mean(div^2) ~ 0.76            => lambda ~ O(1e-1)
+    divergence_lambda: 0.087
+    cylinder_no_slip_lambda: 800.0
 
     # Optional fixed wall temperature enforcement (disabled by default)
     # cylinder_temperature_lambda: 0.0

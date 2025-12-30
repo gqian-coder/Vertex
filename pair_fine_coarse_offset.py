@@ -9,7 +9,7 @@ loader_fine = ExodusDataLoader('dataset/002-Re-148_3-AC-beta-10000-Helios/360-12
 fine_data = loader_fine.load()
 loader_fine.close()
 
-loader_interp = ExodusDataLoader('paraview/180-60_to_360-120_interpolated_linear.exo')
+loader_interp = ExodusDataLoader('paraview/90-30_to_360-120_interpolated_linear.exo')
 interp_data = loader_interp.load()
 loader_interp.close()
 
@@ -21,8 +21,8 @@ print('='*70)
 fine_start = 10
 print(f'\nStarting from fine mesh timestep {fine_start}')
 
-# Test offsets from -20 to +60 (extended range)
-offset_range = range(-20, 61)
+# Test offsets from -20 to +20 (extended range)
+offset_range = range(-20, 20)
 results = []
 
 print(f'\nTesting offsets from {min(offset_range)} to {max(offset_range)}...')

@@ -9,8 +9,8 @@ data:
   fine_file: '/home/qg7/Vertex/dataset/002-Re-148_3-AC-beta-10000-Helios/360-120/cropped.e'
   
   # Timestep offset: interpolated[t + offset] = fine[t]
-  # For your data: interpolated[ts+9] = fine[ts], so offset=9
-  timestep_offset: 9
+  # For your data: interpolated[ts+8] = fine[ts], so offset=8
+  timestep_offset: 8 
   
   # Caching (optional, usually not needed for pre-interpolated data)
   use_cache: false
@@ -25,16 +25,16 @@ model:
 
 training:
   batch_size: 1                  # Graph data typically uses batch_size=1
-  learning_rate: 0.001
+  learning_rate: 0.0005
   weight_decay: 0.00001
-  num_epochs: 100
+  num_epochs: 120
   save_every: 10
   output_dir: './outputs_correction'
   validation_split: 0.2          # Use 20% of timesteps for validation
   residual_learning: true        # Train model to predict (fine - interpolated) residuals
   residual_normalization: true   # Normalize residual targets: (residual - mean) / std (stats saved in checkpoint)
   residual_norm_eps: 1.0e-8      # Std clamp to avoid divide-by-zero
-  smoothness_lambda: 1e-4         # Graph smoothness penalty weight on predicted correction (e.g., 1e-4)
+  smoothness_lambda: 1.0e-4         # Graph smoothness penalty weight on predicted correction (e.g., 1e-4)
 
 # Note: This mode trains the model to learn corrections/residuals
 # Input: Pre-interpolated fields on fine mesh

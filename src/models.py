@@ -350,7 +350,7 @@ if __name__ == "__main__":
     
     # Create dummy data
     num_nodes = 1000
-    in_channels = 6  # 2D coords + 4 fields
+    in_channels = 5  # 2D coords + 3 fields (vx, vy, p)
     out_channels = 4
     
     x = torch.randn(num_nodes, in_channels)

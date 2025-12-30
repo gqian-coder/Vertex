@@ -27,10 +27,24 @@ def load_model(checkpoint_path: str, device: torch.device):
     
     # Reconstruct model
     ndim = 2  # Assuming 2D
-    in_channels = ndim + 4
+
+    def _infer_in_channels(sd: Dict, model_type: str) -> int:
+        if model_type == 'gnn':
+            w = sd.get('input_mlp.0.weight')
+        elif model_type == 'encoder_decoder':
+            w = sd.get('encoders.0.0.weight')
+        elif model_type == 'mlp':
+            w = sd.get('network.0.weight')
+        else:
+            w = None
+        if w is None:
+            return ndim + 4
+        return int(w.shape[1])
+
     out_channels = 4
     
     model_type = config['model']['type']
+    in_channels = _infer_in_channels(state_dict, model_type)
     if model_type == 'gnn':
         model = MeshGNN(
             in_channels=in_channels,
@@ -141,8 +155,24 @@ def inference(coarse_file: str, fine_coords: np.ndarray, model_path: str,
     coarse_features = np.stack(coarse_features, axis=-1)
     coarse_interp_raw = interpolator.interpolate(coarse_features).astype(np.float32)
 
+    # Select model input fields.
+    # Prefer indices stored in the checkpoint config; otherwise, fall back to what the model expects.
+    def _model_in_channels(m) -> int:
+        if hasattr(m, 'input_mlp'):
+            return int(m.input_mlp[0].in_features)
+        if hasattr(m, 'encoders'):
+            return int(m.encoders[0][0].in_features)
+        if hasattr(m, 'network'):
+            return int(m.network[0].in_features)
+        raise ValueError('Could not infer in_channels from model')
+
+    input_feature_indices = (config.get('training', {}) or {}).get('input_feature_indices')
+    if not input_feature_indices:
+        n_input_fields = max(_model_in_channels(model) - int(fine_coords.shape[1]), 0)
+        input_feature_indices = list(range(n_input_fields))
+    coarse_interp_in = coarse_interp_raw[:, input_feature_indices]
+
     # Apply the same input normalization used during training (if any)
-    coarse_interp_in = coarse_interp_raw
     if input_normalization and input_stats is not None and 'mean' in input_stats and 'std' in input_stats:
         mean = np.asarray(input_stats['mean'], dtype=np.float32)
         std = np.asarray(input_stats['std'], dtype=np.float32)

@@ -106,6 +106,52 @@ This generates:
 - Visualization plots comparing coarse interpolation vs. model prediction
 - Error analysis (if ground truth provided)
 
+### 3. Evaluating a Correction Model (per-timestep metrics)
+
+If you trained a correction/residual model (pre-interpolated workflow), you can evaluate errors per timestep and per variable:
+
+```bash
+source ~/module_load.sh
+python3.12 evaluate_correction_model.py --config config_preinterpolated_physics.yaml --device cuda
+```
+
+This writes a long-format CSV and a JSON summary under the evaluation folder (typically under an outputs directory such as `outputs_correction_physics/evaluation/`):
+- `errors_by_variable_and_timestep.csv`
+- `summary_mean_errors.json`
+
+The CSV includes metrics like `rmse`, `mae`, plus min/max diagnostics and relative errors at extrema.
+
+### 4. Plotting the Evaluation CSV
+
+Use the included parser/plotter script to generate diagnostic plots:
+
+```bash
+source ~/module_load.sh
+python parse_evaluation_csv.py --csv outputs_correction_physics/evaluation/errors_by_variable_and_timestep.csv
+```
+
+Optionally, you can also compare extrema values directly between the **original coarse** mesh and the **fine** mesh (no interpolation, no node mapping) to diagnose baseline bias:
+
+```bash
+source ~/module_load.sh
+python parse_evaluation_csv.py \
+  --csv outputs_correction_physics/evaluation/errors_by_variable_and_timestep.csv \
+  --yaml-config config_preinterpolated_physics.yaml \
+  --coarse-file dataset/002-Re-148_3-AC-beta-10000-Helios/90-30/cropped.e
+```
+
+If coarse/fine timesteps are not aligned, you can shift the coarse index with `--coarse-to-fine-offset` (uses `coarse[t + offset]` vs `fine[t]`).
+
+This writes PNGs next to the CSV, including:
+- `rmse_by_variable_over_time.png`
+- `minmax_true_vs_model.png`
+- `relerr_at_true_extrema_model.png`
+- `relerr_of_extrema_values_model.png`
+- `relerr_of_extrema_values_interpolated.png`
+- `bias_by_variable_over_time.png` (if present in CSV)
+- `mean_relative_error_by_variable_over_time.png` (if present in CSV)
+- `relerr_of_extrema_values_coarse_vs_fine.png` (when using `--yaml-config` + `--coarse-file`)
+
 ## Model Architecture
 
 ### 1. MeshGNN (Graph Neural Network)

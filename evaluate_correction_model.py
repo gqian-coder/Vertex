@@ -54,8 +54,22 @@ def _reconstruct_model_from_checkpoint(checkpoint_path: str, device: torch.devic
     state_dict = checkpoint.get("model_state_dict", {})
 
     # Training scripts assume 2D coords after z-drop for 2D meshes.
+    # Infer in_channels from weights for compatibility with different input feature sets.
     ndim = 2
-    in_channels = ndim + 4
+
+    def _infer_in_channels(sd: Dict, model_type: str) -> int:
+        if model_type == "gnn":
+            w = sd.get("input_mlp.0.weight")
+        elif model_type == "encoder_decoder":
+            w = sd.get("encoders.0.0.weight")
+        elif model_type == "mlp":
+            w = sd.get("network.0.weight")
+        else:
+            w = None
+        if w is None:
+            return ndim + 4
+        return int(w.shape[1])
+
     out_channels = 4
 
     model_type = config["model"]["type"]
@@ -77,6 +91,8 @@ def _reconstruct_model_from_checkpoint(checkpoint_path: str, device: torch.devic
             return int(config["model"].get("hidden_channels", 128))
         # torch tensor shape [out, in]
         return int(w.shape[0])
+    in_channels = _infer_in_channels(state_dict, model_type)
+
     if model_type == "gnn":
         model = MeshGNN(
             in_channels=in_channels,
@@ -140,7 +156,7 @@ def main():
     )
     parser.add_argument(
         "--checkpoint",
-        default=str(REPO_DIR / "outputs_correction" / "best_model.pt"),
+        default=str(REPO_DIR / "outputs_correction_physics" / "best_model.pt"),
         help="Path to trained model checkpoint (best_model.pt)",
     )
     parser.add_argument(
@@ -353,7 +369,24 @@ def main():
             coarse_interp = sample["coarse_interp"].astype(np.float32)  # (n_nodes, 4)
             fine_features = sample["fine_features"].astype(np.float32)  # (n_nodes, 4)
 
-            coarse_interp_in = coarse_interp
+            # Select model input fields.
+            # Prefer indices stored in the checkpoint config; otherwise, fall back to whatever
+            # the model architecture expects (inferred from in_channels).
+            def _model_in_channels(m) -> int:
+                if hasattr(m, "input_mlp"):
+                    return int(m.input_mlp[0].in_features)
+                if hasattr(m, "encoders"):
+                    return int(m.encoders[0][0].in_features)
+                if hasattr(m, "network"):
+                    return int(m.network[0].in_features)
+                raise ValueError("Could not infer in_channels from model")
+
+            inferred_in_channels = _model_in_channels(model)
+            n_input_fields = max(inferred_in_channels - fine_coords_in.shape[1], 0)
+            input_feature_indices = (ckpt_config.get("training", {}) or {}).get("input_feature_indices")
+            if not input_feature_indices:
+                input_feature_indices = list(range(n_input_fields))
+            coarse_interp_in = coarse_interp[:, input_feature_indices]
             if input_normalization and input_stats is not None and ("mean" in input_stats) and ("std" in input_stats):
                 mean = np.asarray(input_stats["mean"], dtype=np.float32)
                 std = np.asarray(input_stats["std"], dtype=np.float32)
@@ -375,9 +408,45 @@ def main():
                 mae_per_var = np.mean(np.abs(diff), axis=0)
                 rmse_per_var = np.sqrt(mse_per_var)
 
+                # Mean signed error (bias) per variable
+                bias_per_var = np.mean(diff, axis=0)
+
+                # Mean relative error per variable: mean((pred-true)/true) over nodes where |true| is not tiny.
+                # Keep sign; use NaN when denominator is ~0.
+                rel_eps = 1e-12
+                denom = fine_features
+                rel = np.full_like(diff, np.nan, dtype=np.float64)
+                mask = np.abs(denom) > rel_eps
+                rel[mask] = (diff[mask] / denom[mask]).astype(np.float64)
+                mean_rel_err_per_var = np.nanmean(rel, axis=0)
+
+                # Extrema diagnostics per variable (computed against ground-truth locations)
+                # For each variable v:
+                #   k_max = argmax(true_v)
+                #   rel_err_at_true_max = (pred_v[k_max] - true_max) / true_max
+                # Same for min.
+                eps = 1e-12
+                true_min = np.min(fine_features, axis=0)
+                true_max = np.max(fine_features, axis=0)
+                pred_min = np.min(pred_or_interp, axis=0)
+                pred_max = np.max(pred_or_interp, axis=0)
+                idx_true_min = np.argmin(fine_features, axis=0)
+                idx_true_max = np.argmax(fine_features, axis=0)
+
                 for var_idx, (var_std, var_name) in enumerate(
                     zip(VARIABLES_STD, VARIABLES_FRIENDLY)
                 ):
+                    k_min = int(idx_true_min[var_idx])
+                    k_max = int(idx_true_max[var_idx])
+                    tmin = float(true_min[var_idx])
+                    tmax = float(true_max[var_idx])
+
+                    pred_at_tmin = float(pred_or_interp[k_min, var_idx])
+                    pred_at_tmax = float(pred_or_interp[k_max, var_idx])
+
+                    rel_err_tmin = (pred_at_tmin - tmin) / tmin if abs(tmin) > eps else float("nan")
+                    rel_err_tmax = (pred_at_tmax - tmax) / tmax if abs(tmax) > eps else float("nan")
+
                     records.append(
                         {
                             "timestep_fine": t_fine,
@@ -388,6 +457,24 @@ def main():
                             "mse": float(mse_per_var[var_idx]),
                             "rmse": float(rmse_per_var[var_idx]),
                             "mae": float(mae_per_var[var_idx]),
+
+                            # Bias + mean relative error
+                            "bias": float(bias_per_var[var_idx]),
+                            "mean_rel_err": float(mean_rel_err_per_var[var_idx])
+                            if np.isfinite(mean_rel_err_per_var[var_idx])
+                            else float("nan"),
+
+                            # Diagnostics: extrema and relative error at GT extrema locations
+                            "true_min": tmin,
+                            "true_max": tmax,
+                            "pred_min": float(pred_min[var_idx]),
+                            "pred_max": float(pred_max[var_idx]),
+                            "idx_true_min": k_min,
+                            "idx_true_max": k_max,
+                            "pred_at_true_min": pred_at_tmin,
+                            "pred_at_true_max": pred_at_tmax,
+                            "rel_err_at_true_min": float(rel_err_tmin),
+                            "rel_err_at_true_max": float(rel_err_tmax),
                         }
                     )
 
@@ -431,6 +518,18 @@ def main():
             "mse",
             "rmse",
             "mae",
+            "bias",
+            "mean_rel_err",
+            "true_min",
+            "true_max",
+            "pred_min",
+            "pred_max",
+            "idx_true_min",
+            "idx_true_max",
+            "pred_at_true_min",
+            "pred_at_true_max",
+            "rel_err_at_true_min",
+            "rel_err_at_true_max",
         ]
         with open(csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
