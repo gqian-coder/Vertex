@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 from data_loader import load_all_resolutions, ExodusDataLoader
 from mesh_interpolation import MeshInterpolator, create_training_pairs
 from models import MeshGNN, MeshEncoderDecoder, SimpleMLP, create_graph_data, build_knn_graph
+from device_utils import select_torch_device, format_available_cuda_devices
 
 
 class MeshDataset(Dataset):
@@ -781,7 +782,10 @@ def train_model(config: Dict):
         config: Configuration dictionary
     """
     # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device_str = (config.get('training', {}) or {}).get('device', None)
+    device = select_torch_device(device_str)
+    if device.type == 'cuda':
+        print(format_available_cuda_devices())
     print(f"Using device: {device}")
     
     # Load data
@@ -1025,11 +1029,16 @@ def train_model(config: Dict):
 
 if __name__ == "__main__":
     import sys
+    import argparse
     
+    parser = argparse.ArgumentParser(description="Train model")
+    parser.add_argument('config', nargs='?', default=None, help='Path to config YAML')
+    parser.add_argument('--device', default=None, help="Device: cpu, cuda, cuda:0, cuda:1, ...")
+    args = parser.parse_args()
+
     # Load configuration
-    if len(sys.argv) > 1:
-        config_path = sys.argv[1]
-        with open(config_path, 'r') as f:
+    if args.config is not None:
+        with open(args.config, 'r') as f:
             config = yaml.safe_load(f)
     else:
         # Default configuration
@@ -1056,4 +1065,7 @@ if __name__ == "__main__":
             }
         }
     
+    config.setdefault('training', {})
+    if args.device is not None:
+        config['training']['device'] = args.device
     train_model(config)

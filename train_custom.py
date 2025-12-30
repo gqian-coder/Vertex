@@ -17,14 +17,20 @@ from train import MeshDataset, train_epoch, validate
 from models import MeshGNN, SimpleMLP, MeshEncoderDecoder
 import numpy as np
 from model_physics import physics_config_from_training_cfg
+from device_utils import select_torch_device, format_available_cuda_devices
 
 
-def train_custom(config_path='config_custom.yaml'):
+def train_custom(config_path='config_custom.yaml', device=None):
     """Train model with custom file paths."""
     
     # Load config
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
+
+    # Device selection (CLI overrides config).
+    config.setdefault('training', {})
+    device_str = device if device is not None else config.get('training', {}).get('device', None)
+    config['training']['device'] = device_str
     
     # Check if using pre-interpolated data
     use_preinterpolated = 'interpolated_file' in config['data']
@@ -35,7 +41,6 @@ def train_custom(config_path='config_custom.yaml'):
     coord_norm_eps = float(config.get('training', {}).get('coord_norm_eps', 1e-8))
 
     # Persist effective settings so they get captured in checkpoints.
-    config.setdefault('training', {})
     config['training']['input_normalization'] = input_normalization
     config['training']['input_norm_eps'] = input_norm_eps
     config['training']['normalize_coords'] = normalize_coords
@@ -215,11 +220,13 @@ def train_custom(config_path='config_custom.yaml'):
     else:
         raise ValueError(f"Unknown model type: {model_type}")
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device)
+    device_t = select_torch_device(device_str)
+    if device_t.type == 'cuda':
+        print(format_available_cuda_devices())
+    model = model.to(device_t)
     
     print(f"\nModel: {model_type}")
-    print(f"Device: {device}")
+    print(f"Device: {device_t}")
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     # Optimizer and scheduler
@@ -250,7 +257,7 @@ def train_custom(config_path='config_custom.yaml'):
             train_loader,
             optimizer,
             criterion,
-            device,
+            device_t,
             use_graph,
             smoothness_lambda=smoothness_lambda,
             physics_cfg=physics_cfg,
@@ -263,7 +270,7 @@ def train_custom(config_path='config_custom.yaml'):
             model,
             val_loader,
             criterion,
-            device,
+            device_t,
             use_graph,
             smoothness_lambda=smoothness_lambda,
             physics_cfg=physics_cfg,
@@ -322,6 +329,11 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='config_custom.yaml', help='Path to config file')
+    parser.add_argument(
+        '--device',
+        default=None,
+        help="Device to use: cpu, cuda, cuda:0, cuda:1, ... (default: auto)",
+    )
     args = parser.parse_args()
     
-    train_custom(args.config)
+    train_custom(args.config, device=args.device)

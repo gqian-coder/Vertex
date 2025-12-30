@@ -16,6 +16,9 @@ model:
   k_neighbors: 8                 # Number of neighbors for graph construction
 
 training:
+  # Optional: device selection. Examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1'.
+  # If omitted/null: auto-select (cuda:0 if available else cpu).
+  device: null
   batch_size: 1                  # Usually 1 for graph data
   learning_rate: 0.001
   weight_decay: 0.00001

@@ -11,6 +11,8 @@ import argparse
 from typing import Dict
 import matplotlib.pyplot as plt
 
+from device_utils import select_torch_device, format_available_cuda_devices
+
 from data_loader import ExodusDataLoader
 from mesh_interpolation import MeshInterpolator, save_interpolated_to_exodus
 from models import MeshGNN, MeshEncoderDecoder, SimpleMLP, create_graph_data
@@ -105,7 +107,8 @@ def load_model(checkpoint_path: str, device: torch.device):
 
 def inference(coarse_file: str, fine_coords: np.ndarray, model_path: str, 
              timestep: int = 0, output_dir: str = './predictions',
-             save_exodus: bool = False, fine_connectivity: np.ndarray = None):
+             save_exodus: bool = False, fine_connectivity: np.ndarray = None,
+             device=None):
     """
     Run inference on coarse mesh data.
     
@@ -118,12 +121,14 @@ def inference(coarse_file: str, fine_coords: np.ndarray, model_path: str,
         save_exodus: Whether to save predictions as ExodusII for ParaView
         fine_connectivity: Element connectivity for ExodusII output (optional)
     """
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    device_t = select_torch_device(device)
+    if device_t.type == 'cuda':
+        print(format_available_cuda_devices())
+    print(f"Using device: {device_t}")
     
     # Load model
     print(f"Loading model from {model_path}...")
-    model, config, residual_stats, input_stats, coord_stats = load_model(model_path, device)
+    model, config, residual_stats, input_stats, coord_stats = load_model(model_path, device_t)
     use_graph = config['model']['type'] in ['gnn', 'encoder_decoder']
     residual_learning = bool(config.get('training', {}).get('residual_learning', False))
     residual_normalization = bool(config.get('training', {}).get('residual_normalization', False))
@@ -423,6 +428,8 @@ if __name__ == "__main__":
                        help='Output directory')
     parser.add_argument('--save_exodus', action='store_true',
                        help='Save predictions as ExodusII file for ParaView')
+    parser.add_argument('--device', type=str, default=None,
+                       help='Device: cpu, cuda, cuda:0, cuda:1, ... (default: auto)')
     
     args = parser.parse_args()
     
@@ -443,7 +450,8 @@ if __name__ == "__main__":
         timestep=args.timestep,
         output_dir=args.output_dir,
         save_exodus=args.save_exodus,
-        fine_connectivity=fine_connectivity
+        fine_connectivity=fine_connectivity,
+        device=args.device,
     )
     
     # Visualize

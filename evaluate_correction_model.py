@@ -31,6 +31,7 @@ sys.path.insert(0, str(REPO_DIR / "src"))
 from data_loader import ExodusDataLoader  # noqa: E402
 from train import MeshDataset  # noqa: E402
 from models import build_knn_graph, MeshGNN, MeshEncoderDecoder, SimpleMLP  # noqa: E402
+from device_utils import select_torch_device, format_available_cuda_devices  # noqa: E402
 
 
 VARIABLES_STD = ["velocity_0", "velocity_1", "pressure", "temperature"]
@@ -205,11 +206,9 @@ def main():
     fine_file = config["data"]["fine_file"]
     timestep_offset = int(config["data"].get("timestep_offset", 0))
 
-    device = (
-        torch.device(args.device)
-        if args.device is not None
-        else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    )
+    device = select_torch_device(args.device)
+    if device.type == "cuda":
+        print(format_available_cuda_devices())
 
     checkpoint_path = Path(args.checkpoint)
     if not checkpoint_path.exists():
