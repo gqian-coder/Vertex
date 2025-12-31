@@ -35,6 +35,22 @@ training:
   # Optional graph-smoothness penalty on predicted correction (graph models only, residual_learning only).
   smoothness_lambda: 0.0
 
+  # -----------------------------
+  # Data loss configuration
+  # -----------------------------
+  # Choose which loss is optimized during training:
+  #   - 'mse'   (weighted L2)
+  #   - 'huber' (weighted SmoothL1)
+  data_loss_type: 'mse'
+  # Huber transition point (beta). Only used when data_loss_type='huber'.
+  data_loss_huber_delta: 1.0
+  # Per-output-channel weights. Set to null to disable weighting.
+  # IMPORTANT: length must match the model output channels.
+  # Examples:
+  #   - 4 outputs (vx, vy, p, T): [1.0, 1.0, 5.0, 1.0]
+  #   - 3 outputs (vx, vy, p):   [1.0, 1.0, 5.0]
+  data_loss_channel_weights: null
+
 # To train with different settings, modify these parameters:
 # - For coarse -> finest: Change target_resolution to 'finest'
 # - For larger model: Increase hidden_channels and num_layers

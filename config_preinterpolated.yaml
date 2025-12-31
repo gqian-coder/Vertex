@@ -30,7 +30,7 @@ training:
   batch_size: 1                  # Graph data typically uses batch_size=1
   learning_rate: 0.0005
   weight_decay: 0.00001
-  num_epochs: 120
+  num_epochs: 250
   save_every: 10
   output_dir: './outputs_correction'
   validation_split: 0.2          # Use 20% of timesteps for validation
@@ -38,6 +38,19 @@ training:
   residual_normalization: true   # Normalize residual targets: (residual - mean) / std (stats saved in checkpoint)
   residual_norm_eps: 1.0e-8      # Std clamp to avoid divide-by-zero
   smoothness_lambda: 1.0e-4         # Graph smoothness penalty weight on predicted correction (e.g., 1e-4)
+
+  # -----------------------------
+  # Data loss configuration
+  # -----------------------------
+  # Choose which loss is optimized during training:
+  #   - 'mse'   (weighted L2)
+  #   - 'huber' (weighted SmoothL1)
+  data_loss_type: 'mse'
+  # Huber transition point (beta). Only used when data_loss_type='huber'.
+  data_loss_huber_delta: 1.0
+  # Per-output-channel weights. For 3-output correction models (vx, vy, p):
+  # use [1.0, 1.0, <pressure_weight>].
+  data_loss_channel_weights: [1.0, 1.0, 5.0]
 
 # Note: This mode trains the model to learn corrections/residuals
 # Input: Pre-interpolated fields on fine mesh

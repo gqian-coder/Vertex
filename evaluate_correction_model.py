@@ -34,8 +34,12 @@ from models import build_knn_graph, MeshGNN, MeshEncoderDecoder, SimpleMLP  # no
 from device_utils import select_torch_device, format_available_cuda_devices  # noqa: E402
 
 
-VARIABLES_STD = ["velocity_0", "velocity_1", "pressure", "temperature"]
-VARIABLES_FRIENDLY = ["velocity_x", "velocity_y", "pressure", "temperature"]
+# Evaluation variable set.
+# Training may include temperature as an output field, but the common usage for
+# correction evaluation is to focus on (vx, vy, p). We therefore ignore
+# temperature in metrics and outputs here.
+VARIABLES_STD = ["velocity_0", "velocity_1", "pressure"]
+VARIABLES_FRIENDLY = ["velocity_x", "velocity_y", "pressure"]
 
 
 def _load_yaml(path: str) -> Dict:
@@ -71,7 +75,33 @@ def _reconstruct_model_from_checkpoint(checkpoint_path: str, device: torch.devic
             return ndim + 4
         return int(w.shape[1])
 
-    out_channels = 4
+    def _infer_out_channels(sd: Dict, model_type: str) -> int:
+        # Infer number of output channels from the last linear layer.
+        # This keeps evaluation compatible with checkpoints trained without temperature.
+        if model_type == "gnn":
+            w = sd.get("output_mlp.6.weight")
+        elif model_type == "encoder_decoder":
+            w = sd.get("output_head.2.weight")
+        elif model_type == "mlp":
+            # Final Linear weight is the last parameter in the Sequential.
+            w = None
+            candidates = [k for k in sd.keys() if k.startswith("network.") and k.endswith(".weight")]
+            if candidates:
+                # network.<idx>.weight where idx is int; choose the max.
+                def _idx(k: str) -> int:
+                    try:
+                        return int(k.split(".")[1])
+                    except Exception:
+                        return -1
+
+                w = sd.get(max(candidates, key=_idx))
+        else:
+            w = None
+        if w is None:
+            return 4
+        return int(w.shape[0])
+
+    out_channels = _infer_out_channels(state_dict, config["model"]["type"])
 
     model_type = config["model"]["type"]
 
@@ -157,7 +187,7 @@ def main():
     )
     parser.add_argument(
         "--checkpoint",
-        default=str(REPO_DIR / "outputs_correction_physics" / "best_model.pt"),
+        default=str(REPO_DIR / "outputs_correction" / "best_model.pt"),
         help="Path to trained model checkpoint (best_model.pt)",
     )
     parser.add_argument(
@@ -401,8 +431,24 @@ def main():
 
             pred_np = pred.detach().cpu().numpy()
 
+            eval_var_indices = [0, 1, 2]
+
+            def _select_eval_vars(arr: np.ndarray) -> np.ndarray:
+                # Some datasets/checkpoints may carry 4 fields (including temperature).
+                # Evaluation here uses only the first three: [vx, vy, p].
+                if arr.ndim != 2:
+                    raise ValueError(f"Expected 2D array for fields, got shape={arr.shape}")
+                if arr.shape[1] < max(eval_var_indices) + 1:
+                    raise ValueError(
+                        f"Not enough field channels for evaluation: got {arr.shape[1]}, need at least {max(eval_var_indices)+1}"
+                    )
+                return arr[:, eval_var_indices]
+
+            fine_eval = _select_eval_vars(fine_features)
+
             def _add_records(source: str, pred_or_interp: np.ndarray):
-                diff = pred_or_interp - fine_features
+                pred_eval = _select_eval_vars(pred_or_interp)
+                diff = pred_eval - fine_eval
                 mse_per_var = np.mean(diff ** 2, axis=0)
                 mae_per_var = np.mean(np.abs(diff), axis=0)
                 rmse_per_var = np.sqrt(mse_per_var)
@@ -413,7 +459,7 @@ def main():
                 # Mean relative error per variable: mean((pred-true)/true) over nodes where |true| is not tiny.
                 # Keep sign; use NaN when denominator is ~0.
                 rel_eps = 1e-12
-                denom = fine_features
+                denom = fine_eval
                 rel = np.full_like(diff, np.nan, dtype=np.float64)
                 mask = np.abs(denom) > rel_eps
                 rel[mask] = (diff[mask] / denom[mask]).astype(np.float64)
@@ -425,12 +471,12 @@ def main():
                 #   rel_err_at_true_max = (pred_v[k_max] - true_max) / true_max
                 # Same for min.
                 eps = 1e-12
-                true_min = np.min(fine_features, axis=0)
-                true_max = np.max(fine_features, axis=0)
-                pred_min = np.min(pred_or_interp, axis=0)
-                pred_max = np.max(pred_or_interp, axis=0)
-                idx_true_min = np.argmin(fine_features, axis=0)
-                idx_true_max = np.argmax(fine_features, axis=0)
+                true_min = np.min(fine_eval, axis=0)
+                true_max = np.max(fine_eval, axis=0)
+                pred_min = np.min(pred_eval, axis=0)
+                pred_max = np.max(pred_eval, axis=0)
+                idx_true_min = np.argmin(fine_eval, axis=0)
+                idx_true_max = np.argmax(fine_eval, axis=0)
 
                 for var_idx, (var_std, var_name) in enumerate(
                     zip(VARIABLES_STD, VARIABLES_FRIENDLY)
@@ -440,8 +486,8 @@ def main():
                     tmin = float(true_min[var_idx])
                     tmax = float(true_max[var_idx])
 
-                    pred_at_tmin = float(pred_or_interp[k_min, var_idx])
-                    pred_at_tmax = float(pred_or_interp[k_max, var_idx])
+                    pred_at_tmin = float(pred_eval[k_min, var_idx])
+                    pred_at_tmax = float(pred_eval[k_max, var_idx])
 
                     rel_err_tmin = (pred_at_tmin - tmin) / tmin if abs(tmin) > eps else float("nan")
                     rel_err_tmax = (pred_at_tmax - tmax) / tmax if abs(tmax) > eps else float("nan")
@@ -485,7 +531,14 @@ def main():
                     mean = np.asarray(residual_stats["mean"], dtype=np.float32)
                     std = np.asarray(residual_stats["std"], dtype=np.float32)
                     correction = correction * std + mean
-                model_fields = coarse_interp + correction
+                # Apply correction into baseline fields safely (supports 3-output checkpoints).
+                model_fields = coarse_interp.copy()
+                out_idx = (ckpt_config.get("training", {}) or {}).get("output_feature_indices")
+                if out_idx:
+                    out_idx = [int(i) for i in out_idx]
+                else:
+                    out_idx = list(range(int(correction.shape[1])))
+                model_fields[:, out_idx] = model_fields[:, out_idx] + correction
             else:
                 model_fields = pred_np
 

@@ -31,5 +31,24 @@ training:
   output_dir: './outputs'
   validation_split: 0.2          # Use 20% of timesteps for validation
 
+  # -----------------------------
+  # Data loss configuration
+  # -----------------------------
+  # Choose which loss is optimized during training:
+  #   - 'mse'   (weighted L2)
+  #   - 'huber' (weighted SmoothL1)
+  data_loss_type: 'mse'
+  # Huber transition point (beta). Only used when data_loss_type='huber'.
+  data_loss_huber_delta: 1.0
+  # Per-output-channel weights. For 3-output training (vx, vy, p), a common
+  # choice to emphasize pressure is [1.0, 1.0, 5.0] or higher.
+  # If omitted, train_custom.py defaults to [1.0, 1.0, 5.0] (vx, vy, p).
+  data_loss_channel_weights: [1.0, 1.0, 5.0]
+
+  # Optional: explicitly control which fields are used as inputs/outputs.
+  # Assumes stacked field order [vx, vy, p, T].
+  input_feature_indices: [0, 1, 2]
+  output_feature_indices: [0, 1, 2]
+
 # Note: The training script will automatically handle linear interpolation
 # from coarse to fine mesh during data loading

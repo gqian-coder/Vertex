@@ -22,6 +22,111 @@ from models import MeshGNN, MeshEncoderDecoder, SimpleMLP, create_graph_data, bu
 from device_utils import select_torch_device, format_available_cuda_devices
 
 
+def _as_channel_weights(
+    channel_weights: Optional[List[float]],
+    out: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    if channel_weights is None:
+        return None
+    w = torch.as_tensor(channel_weights, dtype=out.dtype, device=out.device)
+    if w.ndim != 1:
+        raise ValueError(f"data_loss_channel_weights must be 1D, got shape={tuple(w.shape)}")
+    if out.ndim != 2:
+        raise ValueError(f"Expected model output to be 2D (N,C), got shape={tuple(out.shape)}")
+    if int(w.shape[0]) != int(out.shape[1]):
+        raise ValueError(
+            f"data_loss_channel_weights length mismatch: expected {int(out.shape[1])}, got {int(w.shape[0])}"
+        )
+    if not torch.isfinite(w).all():
+        raise ValueError("data_loss_channel_weights contains non-finite values")
+    if float(w.sum().detach().cpu()) <= 0.0:
+        raise ValueError("data_loss_channel_weights must sum to > 0")
+    return w
+
+
+def _weighted_mse_loss(
+    out: torch.Tensor,
+    target: torch.Tensor,
+    channel_weights: Optional[List[float]] = None,
+) -> torch.Tensor:
+    diff = out - target
+    per_channel = (diff * diff).mean(dim=0)  # (C,)
+    w = _as_channel_weights(channel_weights, out)
+    if w is None:
+        return per_channel.mean()
+    return (per_channel * w).sum() / w.sum()
+
+
+def _weighted_huber_loss(
+    out: torch.Tensor,
+    target: torch.Tensor,
+    channel_weights: Optional[List[float]] = None,
+    huber_delta: float = 1.0,
+) -> torch.Tensor:
+    import torch.nn.functional as F
+
+    if huber_delta <= 0:
+        raise ValueError("data_loss_huber_delta must be > 0")
+    per_elem = F.smooth_l1_loss(out, target, reduction="none", beta=float(huber_delta))  # (N,C)
+    per_channel = per_elem.mean(dim=0)  # (C,)
+    w = _as_channel_weights(channel_weights, out)
+    if w is None:
+        return per_channel.mean()
+    return (per_channel * w).sum() / w.sum()
+
+
+def compute_data_losses(
+    out: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    data_loss_type: str = "mse",
+    data_loss_channel_weights: Optional[List[float]] = None,
+    data_loss_huber_delta: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return (chosen_loss, mse_loss, huber_loss) for logging/optimization."""
+    mse = _weighted_mse_loss(out, target, channel_weights=data_loss_channel_weights)
+    huber = _weighted_huber_loss(
+        out,
+        target,
+        channel_weights=data_loss_channel_weights,
+        huber_delta=data_loss_huber_delta,
+    )
+
+    lt = str(data_loss_type or "mse").strip().lower()
+    if lt in {"mse", "l2"}:
+        return mse, mse, huber
+    if lt in {"huber", "smooth_l1", "smoothl1"}:
+        return huber, mse, huber
+    raise ValueError(f"Unknown data_loss_type: {data_loss_type} (expected 'mse' or 'huber')")
+
+
+def _channel_labels(n_channels: int) -> List[str]:
+    if n_channels == 3:
+        return ["vx", "vy", "p"]
+    if n_channels == 4:
+        return ["vx", "vy", "p", "T"]
+    return [f"ch{i}" for i in range(int(n_channels))]
+
+
+def _format_per_channel_mse_line(
+    per_channel_mse: np.ndarray,
+    channel_weights: Optional[List[float]] = None,
+) -> str:
+    labels = _channel_labels(int(per_channel_mse.shape[0]))
+    raw_parts = [f"{lab}={float(m):.3e}" for lab, m in zip(labels, per_channel_mse)]
+    msg = "per-ch MSE: " + ", ".join(raw_parts)
+
+    if channel_weights is not None:
+        w = np.asarray(channel_weights, dtype=np.float64)
+        if w.ndim == 1 and w.shape[0] == per_channel_mse.shape[0] and np.isfinite(w).all() and w.sum() > 0:
+            w_norm = w / w.sum()
+            contrib = per_channel_mse.astype(np.float64) * w_norm
+            contrib_parts = [f"{lab}={float(c):.3e}" for lab, c in zip(labels, contrib)]
+            msg += " | weighted contrib: " + ", ".join(contrib_parts)
+            msg += " | w=" + str([float(x) for x in w.tolist()])
+    return msg
+
+
 class MeshDataset(Dataset):
     """Dataset for mesh-based super-resolution with pre-computed interpolation."""
     
@@ -31,6 +136,7 @@ class MeshDataset(Dataset):
                  use_cache: bool = True, cache_dir: str = './cache',
                  target_mode: str = 'absolute',
                  input_feature_indices: Optional[List[int]] = None,
+                 output_feature_indices: Optional[List[int]] = None,
                  residual_normalize: bool = False,
                  residual_stats: Optional[Dict] = None,
                  residual_norm_eps: float = 1e-8,
@@ -81,6 +187,13 @@ class MeshDataset(Dataset):
         if input_feature_indices is None:
             input_feature_indices = [0, 1, 2]
         self.input_feature_indices = [int(i) for i in input_feature_indices]
+
+        # Output/target feature selection.
+        # If set, the dataset returns targets and baseline fields with only these channels.
+        # This enables training models that do not predict temperature.
+        self.output_feature_indices: Optional[List[int]] = None
+        if output_feature_indices is not None:
+            self.output_feature_indices = [int(i) for i in output_feature_indices]
 
         self.residual_normalize = bool(residual_normalize)
         self.residual_norm_eps = float(residual_norm_eps)
@@ -261,9 +374,13 @@ class MeshDataset(Dataset):
         sum_ = None
         sumsq = None
         count = 0
+        out_idx = self.output_feature_indices
         for sample in self.samples:
             coarse_interp = sample['coarse_interp'].astype(np.float64)
             fine_features = sample['fine_features'].astype(np.float64)
+            if out_idx is not None:
+                coarse_interp = coarse_interp[:, out_idx]
+                fine_features = fine_features[:, out_idx]
             residual = fine_features - coarse_interp
             if sum_ is None:
                 sum_ = np.sum(residual, axis=0)
@@ -521,18 +638,25 @@ class MeshDataset(Dataset):
         coarse_interp = sample['coarse_interp']  # (n_fine_nodes, n_features)
         fine_features = sample['fine_features']  # (n_fine_nodes, n_features)
 
+        # Select output channels (targets/baselines) if requested.
+        coarse_interp_out = coarse_interp
+        fine_features_out = fine_features
+        if self.output_feature_indices is not None:
+            coarse_interp_out = coarse_interp[:, self.output_feature_indices]
+            fine_features_out = fine_features[:, self.output_feature_indices]
+
         # Preserve raw baseline and coordinates for optional physics/BC losses.
-        coarse_interp_raw = torch.FloatTensor(coarse_interp)
+        coarse_interp_raw = torch.FloatTensor(coarse_interp_out)
         coords_raw = torch.FloatTensor(self.fine_coords)
 
         if self.target_mode == 'residual':
-            target = fine_features - coarse_interp
+            target = fine_features_out - coarse_interp_out
             if self.residual_normalize:
                 if self._residual_mean is None or self._residual_std is None:
                     raise RuntimeError("Residual normalization requested but stats were not computed")
                 target = (target - self._residual_mean) / self._residual_std
         else:
-            target = fine_features
+            target = fine_features_out
 
         # Prepare (optionally normalized) model inputs.
         input_features = coarse_interp[:, self.input_feature_indices]
@@ -597,6 +721,9 @@ def train_epoch(
     physics_cfg=None,
     residual_stats: Optional[Dict] = None,
     residual_learning: bool = False,
+    data_loss_type: str = "mse",
+    data_loss_channel_weights: Optional[List[float]] = None,
+    data_loss_huber_delta: float = 1.0,
 ):
     """Train for one epoch."""
     model.train()
@@ -605,11 +732,15 @@ def train_epoch(
 
     # Component logging (averaged over batches)
     total_data_loss = 0.0
+    total_data_mse = 0.0
+    total_data_huber = 0.0
     total_smooth_loss = 0.0
     total_phys_loss = 0.0
     total_phys_div = 0.0
     total_phys_cyl_ns = 0.0
     total_phys_cyl_t = 0.0
+
+    per_channel_mse_sum: Optional[np.ndarray] = None
     
     for batch in tqdm(loader, desc="Training"):
         optimizer.zero_grad()
@@ -617,7 +748,16 @@ def train_epoch(
         if use_graph:
             batch = batch.to(device)
             out = model(batch.x, batch.edge_index)
-            data_loss = criterion(out, batch.y)
+
+            # Data loss (optionally weighted per-channel; supports MSE or Huber)
+            chosen, mse, huber = compute_data_losses(
+                out,
+                batch.y,
+                data_loss_type=data_loss_type,
+                data_loss_channel_weights=data_loss_channel_weights,
+                data_loss_huber_delta=data_loss_huber_delta,
+            )
+            data_loss = chosen
             loss = data_loss
             if smoothness_lambda and smoothness_lambda > 0:
                 smooth_raw = _graph_smoothness_loss(out, batch.edge_index)
@@ -647,27 +787,54 @@ def train_epoch(
             x, y = batch
             x, y = x.to(device), y.to(device)
             out = model(x)
-            data_loss = criterion(out, y)
+
+            chosen, mse, huber = compute_data_losses(
+                out,
+                y,
+                data_loss_type=data_loss_type,
+                data_loss_channel_weights=data_loss_channel_weights,
+                data_loss_huber_delta=data_loss_huber_delta,
+            )
+            data_loss = chosen
             loss = data_loss
             smooth_loss = 0.0
             phys_loss_val = 0.0
+
+        # Per-channel unweighted MSE diagnostics (averaged over batches).
+        with torch.no_grad():
+            per_ch = ((out - (batch.y if use_graph else y)) ** 2).mean(dim=0).detach().cpu().numpy()
+        if per_channel_mse_sum is None:
+            per_channel_mse_sum = per_ch.astype(np.float64)
+        else:
+            per_channel_mse_sum += per_ch.astype(np.float64)
         
         loss.backward()
         optimizer.step()
         
         total_loss += float(loss.item())
         total_data_loss += float(data_loss.item())
+        total_data_mse += float(mse.detach().cpu().item())
+        total_data_huber += float(huber.detach().cpu().item())
         total_smooth_loss += float(smooth_loss) if not isinstance(smooth_loss, torch.Tensor) else float(smooth_loss.detach().cpu())
         total_phys_loss += float(phys_loss_val)
         num_batches += 1
     
     avg_total = total_loss / max(num_batches, 1)
     avg_data = total_data_loss / max(num_batches, 1)
+    avg_data_mse = total_data_mse / max(num_batches, 1)
+    avg_data_huber = total_data_huber / max(num_batches, 1)
     avg_smooth = total_smooth_loss / max(num_batches, 1)
     avg_phys = total_phys_loss / max(num_batches, 1)
 
+    if per_channel_mse_sum is not None:
+        avg_per_channel_mse = per_channel_mse_sum / max(num_batches, 1)
+        print("  [train] " + _format_per_channel_mse_line(avg_per_channel_mse, data_loss_channel_weights))
+
     if use_graph and (avg_smooth > 0.0 or avg_phys > 0.0):
-        msg = f"  [train loss] total={avg_total:.6g} data={avg_data:.6g}"
+        msg = (
+            f"  [train loss] total={avg_total:.6g} data={avg_data:.6g}"
+            f" (mse={avg_data_mse:.6g}, huber={avg_data_huber:.6g})"
+        )
         if avg_smooth > 0.0:
             msg += f" smooth={avg_smooth:.6g}"
         if avg_phys > 0.0:
@@ -694,6 +861,9 @@ def validate(
     physics_cfg=None,
     residual_stats: Optional[Dict] = None,
     residual_learning: bool = False,
+    data_loss_type: str = "mse",
+    data_loss_channel_weights: Optional[List[float]] = None,
+    data_loss_huber_delta: float = 1.0,
 ):
     """Validate model."""
     model.eval()
@@ -701,18 +871,30 @@ def validate(
     num_batches = 0
 
     total_data_loss = 0.0
+    total_data_mse = 0.0
+    total_data_huber = 0.0
     total_smooth_loss = 0.0
     total_phys_loss = 0.0
     total_phys_div = 0.0
     total_phys_cyl_ns = 0.0
     total_phys_cyl_t = 0.0
+
+    per_channel_mse_sum: Optional[np.ndarray] = None
     
     with torch.no_grad():
         for batch in loader:
             if use_graph:
                 batch = batch.to(device)
                 out = model(batch.x, batch.edge_index)
-                data_loss = criterion(out, batch.y)
+
+                chosen, mse, huber = compute_data_losses(
+                    out,
+                    batch.y,
+                    data_loss_type=data_loss_type,
+                    data_loss_channel_weights=data_loss_channel_weights,
+                    data_loss_huber_delta=data_loss_huber_delta,
+                )
+                data_loss = chosen
                 loss = data_loss
                 if smoothness_lambda and smoothness_lambda > 0:
                     smooth_raw = _graph_smoothness_loss(out, batch.edge_index)
@@ -741,24 +923,52 @@ def validate(
                 x, y = batch
                 x, y = x.to(device), y.to(device)
                 out = model(x)
-                data_loss = criterion(out, y)
+
+                chosen, mse, huber = compute_data_losses(
+                    out,
+                    y,
+                    data_loss_type=data_loss_type,
+                    data_loss_channel_weights=data_loss_channel_weights,
+                    data_loss_huber_delta=data_loss_huber_delta,
+                )
+                data_loss = chosen
                 loss = data_loss
                 smooth_loss = 0.0
                 phys_loss_val = 0.0
+
+            # Per-channel unweighted MSE diagnostics (averaged over batches).
+            with torch.no_grad():
+                tgt = batch.y if use_graph else y
+                per_ch = ((out - tgt) ** 2).mean(dim=0).detach().cpu().numpy()
+            if per_channel_mse_sum is None:
+                per_channel_mse_sum = per_ch.astype(np.float64)
+            else:
+                per_channel_mse_sum += per_ch.astype(np.float64)
             
             total_loss += float(loss.item())
             total_data_loss += float(data_loss.item())
+            total_data_mse += float(mse.detach().cpu().item())
+            total_data_huber += float(huber.detach().cpu().item())
             total_smooth_loss += float(smooth_loss) if not isinstance(smooth_loss, torch.Tensor) else float(smooth_loss.detach().cpu())
             total_phys_loss += float(phys_loss_val)
             num_batches += 1
     
     avg_total = total_loss / max(num_batches, 1)
     avg_data = total_data_loss / max(num_batches, 1)
+    avg_data_mse = total_data_mse / max(num_batches, 1)
+    avg_data_huber = total_data_huber / max(num_batches, 1)
     avg_smooth = total_smooth_loss / max(num_batches, 1)
     avg_phys = total_phys_loss / max(num_batches, 1)
 
+    if per_channel_mse_sum is not None:
+        avg_per_channel_mse = per_channel_mse_sum / max(num_batches, 1)
+        print("  [val]   " + _format_per_channel_mse_line(avg_per_channel_mse, data_loss_channel_weights))
+
     if use_graph and (avg_smooth > 0.0 or avg_phys > 0.0):
-        msg = f"  [val loss] total={avg_total:.6g} data={avg_data:.6g}"
+        msg = (
+            f"  [val loss] total={avg_total:.6g} data={avg_data:.6g}"
+            f" (mse={avg_data_mse:.6g}, huber={avg_data_huber:.6g})"
+        )
         if avg_smooth > 0.0:
             msg += f" smooth={avg_smooth:.6g}"
         if avg_phys > 0.0:
@@ -842,10 +1052,26 @@ def train_model(config: Dict):
         if not isinstance(phys_sidesets, dict) or not phys_sidesets:
             phys_sidesets = {'cylinder': True}
 
+    config.setdefault('training', {})
+
     # By default, drop temperature from model inputs.
     input_feature_indices = config.get('training', {}).get('input_feature_indices', [0, 1, 2])
-    config.setdefault('training', {})
     config['training']['input_feature_indices'] = list(input_feature_indices)
+
+    # Optional: select output channels (targets) to train on.
+    # If omitted, the dataset/model will use all available fields (typically 4: vx, vy, p, T).
+    output_feature_indices = config.get('training', {}).get('output_feature_indices', None)
+    if output_feature_indices is not None:
+        config['training']['output_feature_indices'] = list(output_feature_indices)
+
+    # Data loss configuration (MSE vs Huber, optional per-channel weights).
+    data_loss_type = str(config.get('training', {}).get('data_loss_type', 'mse')).lower()
+    data_loss_huber_delta = float(config.get('training', {}).get('data_loss_huber_delta', 1.0))
+    data_loss_channel_weights = config.get('training', {}).get('data_loss_channel_weights', None)
+    config['training']['data_loss_type'] = data_loss_type
+    config['training']['data_loss_huber_delta'] = data_loss_huber_delta
+    if data_loss_channel_weights is not None:
+        config['training']['data_loss_channel_weights'] = list(data_loss_channel_weights)
 
     dataset = MeshDataset(
         all_data[source_res],
@@ -856,6 +1082,7 @@ def train_model(config: Dict):
         cache_dir=config['data'].get('cache_dir', './cache'),
         target_mode=target_mode,
         input_feature_indices=input_feature_indices,
+        output_feature_indices=output_feature_indices,
         residual_normalize=(residual_learning and residual_normalization),
         residual_norm_eps=residual_norm_eps,
         input_normalize=input_normalization,
@@ -889,7 +1116,11 @@ def train_model(config: Dict):
     ndim = int(getattr(dataset, 'fine_coords').shape[1])
     n_input_fields = len(getattr(dataset, 'input_feature_indices', [0, 1, 2]))
     in_channels = ndim + n_input_fields  # coordinates + selected fields
-    out_channels = 4  # 4 fields
+    out_channels = (
+        len(getattr(dataset, 'output_feature_indices'))
+        if getattr(dataset, 'output_feature_indices', None) is not None
+        else 4
+    )
     
     model_type = config['model']['type']
     if model_type == 'gnn':
@@ -960,6 +1191,9 @@ def train_model(config: Dict):
             physics_cfg=physics_cfg,
             residual_stats=getattr(dataset, 'residual_stats', None),
             residual_learning=residual_learning,
+            data_loss_type=data_loss_type,
+            data_loss_channel_weights=data_loss_channel_weights,
+            data_loss_huber_delta=data_loss_huber_delta,
         )
         train_losses.append(train_loss)
         
@@ -974,6 +1208,9 @@ def train_model(config: Dict):
             physics_cfg=physics_cfg,
             residual_stats=getattr(dataset, 'residual_stats', None),
             residual_learning=residual_learning,
+            data_loss_type=data_loss_type,
+            data_loss_channel_weights=data_loss_channel_weights,
+            data_loss_huber_delta=data_loss_huber_delta,
         )
         val_losses.append(val_loss)
         

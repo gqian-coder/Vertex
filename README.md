@@ -75,7 +75,35 @@ training:
   batch_size: 1
   learning_rate: 0.001
   num_epochs: 100
+
+  # Data loss configuration (optional)
+  # - Choose which loss is optimized: 'mse' (L2) or 'huber' (SmoothL1)
+  # - Optionally apply per-output-channel weights (e.g., emphasize pressure)
+  data_loss_type: 'mse'                 # 'mse' or 'huber'
+  data_loss_huber_delta: 1.0            # only used when data_loss_type='huber'
+  data_loss_channel_weights: null       # set e.g. [1.0, 1.0, 5.0] for [vx, vy, p]
 ```
+
+**Per-channel weighted loss (pressure emphasis)**
+
+If you train a 3-output model (velocity_x, velocity_y, pressure), you can emphasize pressure by setting:
+
+```yaml
+training:
+  data_loss_type: 'mse'
+  data_loss_channel_weights: [1.0, 1.0, 10.0]   # [vx, vy, p]
+```
+
+To try Huber instead:
+
+```yaml
+training:
+  data_loss_type: 'huber'
+  data_loss_huber_delta: 1.0
+  data_loss_channel_weights: [1.0, 1.0, 10.0]
+```
+
+During training, the code prints a small per-epoch breakdown of per-channel MSE (vx/vy/p) plus the weighted contributions to help you tune these weights.
 
 ### 2. Running Inference
 
@@ -180,7 +208,7 @@ Input (coords + fields) → MLP Embedding → GAT Layers (with residuals) → Ou
 2. **Interpolation**: Map coarse mesh fields to fine mesh nodes using linear interpolation
 3. **Graph Construction**: Build k-nearest neighbor graph from fine mesh coordinates
 4. **Model Training**: GNN learns to predict high-res fields from interpolated coarse fields
-5. **Loss**: MSE loss between predicted and ground truth fine fields
+5. **Loss**: Configurable MSE or Huber (SmoothL1), with optional per-channel weights
 
 ### Key Insight
 The model learns the **residual correction** that standard interpolation methods miss:

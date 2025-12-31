@@ -319,14 +319,14 @@ def physics_loss_from_batch(
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Compute optional physics/BC loss terms.
 
-    Requires the dataset to have attached:
-      - batch.coarse_interp_raw  (N,4) unnormalized interpolated baseline
+        Requires the dataset to have attached:
+            - batch.coarse_interp_raw  (N,C) unnormalized interpolated baseline (C>=2)
       - batch.coords_raw         (N,2) raw coordinates
       - optionally batch.mask_cylinder (N,) boolean
 
-    The model_out is assumed to be either:
-      - absolute fields (N,4), or
-      - residual targets (N,4) possibly normalized (if residual_stats provided)
+        The model_out is assumed to be either:
+            - absolute fields (N,C), or
+            - residual targets (N,C) possibly normalized (if residual_stats provided)
 
     We infer residual mode by presence of batch.coarse_interp_raw (always present for our datasets)
     and by the caller deciding what residual_stats to pass.
@@ -342,7 +342,7 @@ def physics_loss_from_batch(
         # Not enough info; silently do nothing to preserve backward compatibility.
         return loss, logs
 
-    coarse_interp_raw = batch.coarse_interp_raw  # (N,4)
+    coarse_interp_raw = batch.coarse_interp_raw  # (N,C)
     coords_raw = batch.coords_raw  # (N,2)
 
     # Convert model output into physical correction/fields.
@@ -352,6 +352,16 @@ def physics_loss_from_batch(
         mean = torch.as_tensor(residual_stats["mean"], device=model_out.device, dtype=model_out.dtype)
         std = torch.as_tensor(residual_stats["std"], device=model_out.device, dtype=model_out.dtype)
         correction = correction * std + mean
+
+    # Align baseline channels with correction channels if needed.
+    if coarse_interp_raw.shape[1] != correction.shape[1]:
+        if coarse_interp_raw.shape[1] > correction.shape[1]:
+            coarse_interp_raw = coarse_interp_raw[:, : correction.shape[1]]
+        else:
+            raise ValueError(
+                f"physics_loss_from_batch channel mismatch: baseline has {coarse_interp_raw.shape[1]} channels, "
+                f"correction has {correction.shape[1]} channels"
+            )
 
     # Assume correction-only mode: fields = baseline + correction
     fields_pred = coarse_interp_raw + correction
@@ -378,6 +388,9 @@ def physics_loss_from_batch(
                 logs["cylinder_no_slip"] = float(l_ns.detach().cpu())
 
         if physics_cfg.cylinder_temperature_lambda and physics_cfg.cylinder_temperature_lambda > 0:
+            if fields_pred.shape[1] < 4:
+                # Temperature channel is not present in this model/dataset.
+                return loss, logs
             if physics_cfg.cylinder_temperature_value is None:
                 raise ValueError(
                     "cylinder_temperature_lambda > 0 but cylinder_temperature_value is None. "
